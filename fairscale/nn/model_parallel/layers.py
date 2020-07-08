@@ -58,7 +58,10 @@ def _initialize_affine_weight(weight, output_size, input_size,
     master_weight = torch.empty(output_size, input_size,
                                 dtype=weight.dtype,
                                 requires_grad=False)
-    init_method(master_weight, gain=1 / math.sqrt(2))
+    try:
+        init_method(master_weight, gain=1 / math.sqrt(2))
+    except TypeError:
+        init_method(master_weight)
 
     # Split and copy
     per_partition_per_stride_size = divide(per_partition_size, stride)
