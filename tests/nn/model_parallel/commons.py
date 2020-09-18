@@ -21,6 +21,7 @@
 
 import functools
 import inspect
+import multiprocessing
 import os
 import random
 
@@ -34,6 +35,12 @@ import torch.multiprocessing as mp
 
 from fairscale.nn.model_parallel import initialize_model_parallel
 from fairscale.nn.model_parallel.random import model_parallel_cuda_manual_seed
+
+try:
+    import torch_ucc  # noqa: F401
+except ImportError as e:
+    print(f"can't import torch_ucc: {e}")
+    pass
 
 
 class IdentityLayer(torch.nn.Module):
@@ -64,7 +71,14 @@ def dist_init(rank, world_size, hostname=None):
 
     if version.parse(torch.__version__).release >= (1, 6, 0):
         init_method = f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}"
-        torch.distributed.init_process_group(backend="nccl", rank=rank, world_size=world_size, init_method=init_method)
+        if torch.cuda.is_available():
+            torch.distributed.init_process_group(
+                backend="nccl", rank=rank, world_size=world_size, init_method=init_method
+            )
+        else:
+            torch.distributed.init_process_group(
+                backend="gloo", rank=rank, world_size=world_size, init_method=init_method
+            )
         os.environ["MASTER_ADDR"] = hostname
         os.environ["MASTER_PORT"] = "10639"
         init_method = f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}"
@@ -99,10 +113,20 @@ def spawn_for_all_world_sizes(test_func, world_sizes=get_world_sizes(), args=[])
         mp.spawn(test_func, args=(world_size, *args), nprocs=world_size, join=True)
 
 
-def helper(rank, world_size, func, args):
+def helper(rank, world_size, func, args, error_queue):
     dist_init(rank, world_size)
-    initialize_model_parallel(1, world_size)
-    func(*args)
+    kwargs = {}
+    if "OMPI_COMM_WORLD_RANK" not in os.environ:
+        kwargs["pipeline_backend"] = "gloo"
+        print(f"init glooo backend")
+    initialize_model_parallel(1, world_size, **kwargs)
+    try:
+        func(*args)
+    except BaseException as e:
+        if e.__class__.__name__ == "Skipped":
+            error_queue.put(str(e))
+            return
+        raise e
 
 
 def torch_spawn(world_sizes=None):
@@ -127,7 +151,12 @@ def torch_spawn(world_sizes=None):
                 kwargs[p] for p in parameters if p != "rank"
             )  # converting named parameters to positional parameters to pass to `spawn`
 
+            error_queue = multiprocessing.get_context("spawn").SimpleQueue()
             if "OMPI_COMM_WORLD_RANK" in os.environ:
+                os.environ["RANK"] = os.environ["OMPI_COMM_WORLD_RANK"]
+                os.environ["WORLD_SIZE"] = os.environ["OMPI_COMM_WORLD_SIZE"]
+                os.environ["MASTER_ADDR"] = "localhost"
+                os.environ["MASTER_PORT"] = "10638"
                 torch.distributed.init_process_group("mpi")
                 world_size = torch.distributed.get_world_size()
                 initialize_model_parallel(1, world_size)
@@ -137,7 +166,11 @@ def torch_spawn(world_sizes=None):
                 else:
                     pytest.skip(f"requested world size doesn't match current world size")
             else:
-                spawn_for_all_world_sizes(helper, world_sizes, (func, args))
+                spawn_for_all_world_sizes(helper, world_sizes, (func, args, error_queue))
+
+            if not error_queue.empty():
+                msg = error_queue.get()
+                pytest.skip(msg)
 
         caller_module = inspect.getmodule(inspect.currentframe().f_back)
         setattr(caller_module, f"test_{name}", replacement)
