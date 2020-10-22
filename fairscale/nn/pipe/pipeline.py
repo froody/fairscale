@@ -35,7 +35,7 @@ from .async_schedule import AsyncEventLoop, ModuleWrapper
 from .checkpoint import Checkpointing
 from .copy import Copy, Wait
 from .dependency import fork, join
-from .messages import Transport, MakeTransport
+from .messages import MakeTransport, Transport
 from .microbatch import Batch
 from .skip import Namespace
 from .skip.layout import SkipLayout
@@ -237,12 +237,12 @@ class Pipeline:
         self.style = style
         self.group = group
         self.training: bool
-        self.transport = MakeTransport(
-            use_rpc=("OMPI_COMM_WORLD_RANK" not in os.environ) or ("FORCE_RPC" in os.environ),
-            worker_map=worker_map,
-            input_device=input_device,
-        )
-
+        if style in [PipelineStyle.MultiProcess, PipelineStyle.AsyncSchedule]:
+            self.transport = MakeTransport(
+                use_rpc=("OMPI_COMM_WORLD_RANK" not in os.environ) or ("FORCE_RPC" in os.environ),
+                worker_map=worker_map,
+                input_device=input_device,
+            )
         self.input_device = input_device
         self.all_at_once = False
         self.callcount = 0
