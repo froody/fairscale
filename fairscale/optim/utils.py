@@ -3,12 +3,13 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-import io
 from typing import Any, Dict
 
 import torch
 from torch._six import container_abcs
 import torch.distributed as dist
+
+from fairscale.utils.object import pyobject_to_tensor, tensor_to_pyobject
 
 
 # Credits:  classy_vision/generic/distributed_util.py
@@ -52,11 +53,8 @@ def broadcast_object(
 
     if dist.get_rank() == src_rank:
         # Emit data
-        buffer = io.BytesIO()
-        torch.save(obj, buffer)
-        data = bytearray(buffer.getbuffer())
-        length_tensor = torch.LongTensor([len(data)]).to(dist_device)
-        data_send_tensor = torch.ByteTensor(data).to(dist_device)
+        data_send_tensor = pyobject_to_tensor(obj).to(dist_device)
+        length_tensor = torch.LongTensor([len(data_send_tensor)]).to(dist_device)
         dist.broadcast(length_tensor, src=src_rank, group=group, async_op=False)
         dist.broadcast(data_send_tensor, src=src_rank, group=group, async_op=False)
     else:
@@ -65,6 +63,5 @@ def broadcast_object(
         dist.broadcast(length_tensor, src=src_rank, group=group, async_op=False)
         data_recv_tensor = torch.empty([int(length_tensor.item())], dtype=torch.uint8, device=dist_device)
         dist.broadcast(data_recv_tensor, src=src_rank, group=group, async_op=False)
-        buffer = io.BytesIO(data_recv_tensor.cpu().numpy())
-        obj = torch.load(buffer, map_location=dist_device)
+        obj = tensor_to_pyobject(data_recv_tensor)
     return obj
