@@ -150,7 +150,7 @@ class PipeBackRedirect(torch.autograd.Function):
         return (None, None, None, None, None)
 
 
-def callback_with_model(callback: Callable, ctx: Any) -> None:
+def callback_with_model(callback: Callable[[Any, Pipe], None], ctx: Any) -> None:
     group = get_pipeline_parallel_group()  # FIXME(tom) handle dynamic group
     set_device_based_on_group(group)
 
@@ -159,6 +159,14 @@ def callback_with_model(callback: Callable, ctx: Any) -> None:
 
 
 class PipeRPCWrapper(nn.Module):
+    """A wrapper for Pipe to control the entire pipeline from a single process.
+    Typical usecase would have rank 0 construct `PipeRPCWrapper` and run the
+    training loop as normal, and all other ranks would call
+    `torch.distributed.rpc.shutdown()`
+
+    To run code on each worker, e.g. to run the optimizer, use `foreach_worker`
+    """
+
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__()
         self.group = cast(ProcessGroup, kwargs.get("group")) or get_pipeline_parallel_group()
@@ -178,23 +186,35 @@ class PipeRPCWrapper(nn.Module):
 
         self.model = Pipe(*args, **kwargs)
         self.worker_map = kwargs["worker_map"]
-        futures = [
-            # FIXME get global rank
-            rpc.rpc_async(self.get_rpc_name(rank), register_remote_model, args=(args, kwargs))
-            for rank in range(1, self.group.size())
-        ]
-        futures = [f.wait() for f in futures]
+        self._foreach_worker(register_remote_model, args=(args, kwargs))
         self.model.cuda()
 
-    def get_rpc_name(self, rank: int) -> str:
+    def _get_rpc_name(self, rank: int) -> str:
         return self.worker_map[_get_global_rank(self.group, rank)]
 
-    def foreach_worker(self, callback: Callable, ctx: Any = None, *, include_self: bool = False) -> None:
-        futures = [
-            rpc.rpc_async(self.get_rpc_name(rank), callback_with_model, args=(callback, ctx))
-            for rank in range(1, self.group.size())
-        ]
+    def _foreach_worker(self, callback: Callable, args: Any = None) -> None:
+        futures = [rpc.rpc_async(self._get_rpc_name(rank), callback, args=args) for rank in range(1, self.group.size())]
         futures = [f.wait() for f in futures]
+
+    def foreach_worker(
+        self, callback: Callable[[Any, Pipe], None], ctx: Any = None, *, include_self: bool = False
+    ) -> None:
+        """Call `callback` on each worker with the `ctx` and model local to that
+        worker. e.g.
+        def register_optimizer(ctx, model):
+            args, kwargs = ctx
+            model.optimizer = torch.optim.SGD(model.parameters(), *args, **kwargs)
+
+        pipe_model = PipeRPCWrapper( ... )
+
+        pipe_model.foreach_worker(
+            register_remote_model,
+            ([], {"lr" : 0.01, "momentum" : 0.9})
+        )
+        """
+
+        self._foreach_worker(callback_with_model, args=(callback, ctx))
+
         if include_self:
             with self.model.lock:
                 callback(ctx, self.model)
@@ -209,7 +229,7 @@ class PipeRPCWrapper(nn.Module):
             num_tensors = len(tensor)
 
         futures = [
-            rpc.rpc_async(self.get_rpc_name(rank), model_forward, args=(self.model.training, shape, dtype))
+            rpc.rpc_async(self._get_rpc_name(rank), model_forward, args=(self.model.training, shape, dtype))
             for rank in range(1, self.group.size())
         ]
 
@@ -222,7 +242,7 @@ class PipeRPCWrapper(nn.Module):
 
             shape, dtype = futures[-1].wait()
             dest_rank = self.group.size() - 1
-            dest = self.get_rpc_name(dest_rank)
+            dest = self._get_rpc_name(dest_rank)
             dest_global_rank = _get_global_rank(self.group, dest_rank)
             src_global_rank = torch.distributed.get_rank()
             queue = EVENT_LOOP_QUEUE

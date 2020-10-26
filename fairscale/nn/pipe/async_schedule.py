@@ -152,7 +152,8 @@ class AsyncEventLoop:
             AsyncMessageType.Activations, result.index, invocation.this, invocation.dest, invocation.order + 1
         )
         self.transport.send_message(
-            PipeMessage(src_rank, dst_rank, queue_name=EVENT_LOOP_QUEUE, args=body, tensors=tuple(*result)), sync=True,
+            PipeMessage(src_rank, dst_rank, queue_name=EVENT_LOOP_QUEUE, args=body, tensors=tuple([*result])),
+            sync=True,
         )
 
         phony = AutogradWithoutActivations.apply(*result)
