@@ -295,17 +295,17 @@ class Pipeline:
                 self.mp_partitions, self.group, self.transport, self.training, self.checkpoint_stop,
             )
             if rank == 0 and not self.final_stage:
-                logging.debug(f"{torch.distributed.get_rank()}: entered event head")
+                print(f"{torch.distributed.get_rank()}: entered event head")
                 event_loop.event_loop_head(batches, skip_trackers, event)
-                logging.debug(f"{torch.distributed.get_rank()}: exited event head")
+                print(f"{torch.distributed.get_rank()}: exited event head")
             elif self.final_stage:
-                logging.debug(f"{torch.distributed.get_rank()}: entered event tail")
+                print(f"{torch.distributed.get_rank()}: entered event tail")
                 event_loop.event_loop_tail(batches, skip_trackers)
-                logging.debug(f"{torch.distributed.get_rank()}: exited event tail")
+                print(f"{torch.distributed.get_rank()}: exited event tail")
             else:
-                logging.debug(f"{torch.distributed.get_rank()}: entered event loop")
+                print(f"{torch.distributed.get_rank()}: entered event loop")
                 event_loop.event_loop(len(batches), skip_trackers)
-                logging.debug(f"{torch.distributed.get_rank()}: exited event loop")
+                print(f"{torch.distributed.get_rank()}: exited event loop")
 
         self.callcount += 1
 
