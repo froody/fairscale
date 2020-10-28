@@ -60,6 +60,29 @@ else:
     NamedModules = OrderedDict
 
 
+import threading, traceback, sys
+
+
+class DebugLock(object):
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    def acquire(self):
+        print(f"acquiring {torch.distributed.get_rank()}, {''.join(traceback.format_stack())}")
+        self._lock.acquire()
+
+    def release(self):
+        print(f"releasing {torch.distributed.get_rank()}")
+        # traceback.print_tb
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+
+    def __exit__(self, type, value, traceback):
+        self.release()
+
+
 def recommend_auto_balance(message: str) -> str:
     """Expands a message with recommendation to :mod:`torchpipe.balance`."""
     return f"""{message}
@@ -486,7 +509,8 @@ class Pipe(Module):
         self.retain_graph = retain_graph
         self.pipeline: Optional[Pipeline]
         self.loss_fn = loss_fn
-        self.lock = threading.Lock()
+        self.lock = threading.Lock()  # DebugLock()
+        #self.lock = DebugLock()
 
         self.group = group
         self.worker_map = worker_map
@@ -767,7 +791,9 @@ class PipelinedBackwardPass(torch.autograd.Function):
         for grad, batch in reversed(list(zip(grad_batches, ctx.batches))):
             for t in batch:
                 t.retain_grad()
+            print(f">>> backward for {batch.index}")
             torch.autograd.backward(batch.tensor_or_tensors, grad_tensors=(*grad,), retain_graph=ctx.retain_graph)
+            print(f"<<< backward for {batch.index}")
 
         with torch.no_grad():
             if ctx.batches[0].atomic:

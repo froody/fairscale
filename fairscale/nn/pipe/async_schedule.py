@@ -132,18 +132,24 @@ class AsyncRecvOperator(torch.autograd.Function):
             sync=True,
         )
 
-        tail_ctx = getattr(ctx, "tail_ctx", None)
-        if tail_ctx:
-            expected_gradients = tail_ctx.expected_gradients
-            while expected_gradients > 0:
-                message = ctx.transport.recv_message_header(EVENT_LOOP_QUEUE)
+        try:
+            tail_ctx = getattr(ctx, "tail_ctx", None)
+            if tail_ctx:
+                expected_gradients = tail_ctx.expected_gradients
+                print(f"tail ctx expected_gradients {expected_gradients}")
+                while expected_gradients > 0:
+                    message = ctx.transport.recv_message_header(EVENT_LOOP_QUEUE)
 
-                args: AsyncMessageBody = message.args
-                assert args.message_type is AsyncMessageType.Gradients
+                    args: AsyncMessageBody = message.args
+                    assert args.message_type is AsyncMessageType.Gradients
 
-                invocation = tail_ctx.invocations[args.order]
-                expected_gradients -= tail_ctx.count_per_order[invocation.order]
-                AsyncEventLoop.perform_backward_for_invocation(ctx.transport, message, tail_ctx.activations, invocation)
+                    invocation = tail_ctx.invocations[args.order]
+                    expected_gradients -= tail_ctx.count_per_order[invocation.order]
+                    AsyncEventLoop.perform_backward_for_invocation(
+                        ctx.transport, message, tail_ctx.activations, invocation
+                    )
+        except Exception as e:
+            print(f"fucaljkrlka {e}")
 
         return (None, None, None, None, None)
 
@@ -340,10 +346,13 @@ class AsyncEventLoop:
             actual_invocations += inv_count
             count_per_order[last_order] = inv_count
 
-            if invocations[last_order].dest is None:
-                self.prepare_tail_backward(
-                    batch, activations, invocations, count_per_order, expected_invocations - inv_count
-                )
+            try:
+                if invocations[last_order].dest is None:
+                    self.prepare_tail_backward(
+                        batch, activations, invocations, count_per_order, len(invocations) - inv_count
+                    )
+            except Exception as e:
+                print(f"fucaljkrlka {e}")
 
         if actual_invocations < expected_invocations:
             expected_gradients = 0  # (len(invocations) - 1) * len(batches)
@@ -434,12 +443,15 @@ class AsyncEventLoop:
                 )
                 count_per_order[last_order] = inv_count
                 num_activations += inv_count
-                if tail and invocations[last_order].dest is None:
-                    self.prepare_tail_backward(
-                        batch, activations, invocations, count_per_order, expected_invocations - inv_count
-                    )
+                try:
+                    if tail and invocations[last_order].dest is None:
+                        self.prepare_tail_backward(
+                            batch, activations, invocations, count_per_order, len(invocations) - inv_count
+                        )
 
-                assert num_activations <= expected_invocations
+                    assert num_activations <= expected_invocations
+                except Exception as e:
+                    print(f"fucaljkrlka {e}")
 
             elif args.message_type is AsyncMessageType.Gradients:
                 num_gradients += count_per_order[invocation.order]

@@ -67,19 +67,24 @@ class PipeBackRedirect(torch.autograd.Function):
         ctx.message.tensors = tuple(grad)
         ctx.transport.send_message(ctx.message, sync=False, skip_header=True)
         ctx.event.set()
-        #torch.futures.wait_all(ctx.futures)
+        # torch.futures.wait_all(ctx.futures)
         return (None, None, None, None, None, None)
 
 
 def callback_with_model(callback: Callable[[Any, Pipe], None], ctx: Any) -> None:
+    print(f">>>> callback_with_model {torch.distributed.get_rank()}, {callback}")
     try:
         group = get_pipeline_parallel_group()  # FIXME(tom) handle dynamic group
         set_device_based_on_group(group)
 
+        print(f"callback_with_model try lock ")
         with PipeModel.lock:
+            print(f"callback_with_model got lock ")
             callback(ctx, PipeModel)
-    except Exception as e:
+    except BaseException as e:
+        print(f"callback_with_model an exception")
         print(f"callback_with_model got {e}")
+    print(f"<<<< callback_with_model {torch.distributed.get_rank()}")
 
 
 class PipeRPCWrapper(nn.Module):
@@ -174,9 +179,12 @@ class PipeRPCWrapper(nn.Module):
             activations = PipeMessage(dest_global_rank, src_global_rank, queue_name=queue, tensor_count=num_tensors)
             grads = PipeMessage(src_global_rank, dest_global_rank, queue_name=queue, tensor_count=num_tensors)
 
-            back_fut = rpc.rpc_async(dest, self._send_result_and_do_backwards, args=(self.model.training, activations, grads))
+            back_fut = rpc.rpc_async(
+                dest, self._send_result_and_do_backwards, args=(self.model.training, activations, grads)
+            )
             futures.append(back_fut)
 
+            print(f"recv result")
             result = self._recv_result(self.model, shape, dtype, activations)
             if isinstance(result, torch.Tensor):
                 result.requires_grad_()
@@ -185,7 +193,9 @@ class PipeRPCWrapper(nn.Module):
                     r.requires_grad_()
 
             assert self.model.pipeline
-            return PipeBackRedirect.apply(result, dest_global_rank, event, grads, self.model.pipeline.transport, futures)
+            return PipeBackRedirect.apply(
+                result, dest_global_rank, event, grads, self.model.pipeline.transport, futures
+            )
 
     @property
     def final_stage(self) -> bool:
@@ -212,26 +222,34 @@ class PipeRPCWrapper(nn.Module):
 
     @staticmethod
     def _send_result_and_do_backwards(training: bool, message: PipeMessage, grads_message: PipeMessage) -> None:
-        group = get_pipeline_parallel_group()
-        set_device_based_on_group(group)
-        result = PipeResult
-        model = PipeModel
+        try:
+            group = get_pipeline_parallel_group()
+            set_device_based_on_group(group)
+            result = PipeResult
+            model = PipeModel
 
-        if isinstance(result, torch.Tensor):
-            result = tuple([result])
+            if isinstance(result, torch.Tensor):
+                result = tuple([result])
 
-        message.tensors = tuple(result)
-        assert model.pipeline
-        transport = model.pipeline.transport
-        transport.send_message(message, sync=False, skip_header=True)
+            message.tensors = tuple(result)
+            assert model.pipeline
+            transport = model.pipeline.transport
+            print(f">>> send_result...")
+            transport.send_message(message, sync=False, skip_header=True)
+            print(f"<<< send_result...")
 
-        if training:
-            grads_message.tensor_shapes = [r.shape for r in result]
-            grads_message.tensor_dtypes = [r.dtype for r in result]
-            grads_message = transport.recv_message_tensors(grads_message)
+            if training:
+                grads_message.tensor_shapes = [r.shape for r in result]
+                grads_message.tensor_dtypes = [r.dtype for r in result]
+                grads_message = transport.recv_message_tensors(grads_message)
 
-            with model.lock:
-                torch.autograd.backward(result, grads_message.tensors, retain_graph=True)
+                with model.lock:
+                    print(f">>> autograd...")
+                    torch.autograd.backward(result, grads_message.tensors, retain_graph=True)
+                    print(f"<<< autograd...")
+        except Exception as e:
+            print(f"fjdalkfjasld {e}")
+            raise e
 
     @staticmethod
     def _register_remote_model(args: List[Any], kwargs: Dict[str, Any]) -> None:
@@ -270,10 +288,11 @@ class PipeRPCWrapper(nn.Module):
             print(f"_model_forward got {e}")
 
     def _model_forward_first_stage(self, tensor: TensorOrTensors, event: Event) -> None:
+        print(f">>> mfffs")
         try:
-            with self.lock:
-                assert self.model.group
-                set_device_based_on_group(self.model.group)
-                self.model(tensor, event=event)
+            assert self.model.group
+            set_device_based_on_group(self.model.group)
+            self.model(tensor, event=event)
         except Exception as e:
             print(f"_model_forward got {e}")
+        print(f"<<< mfffs")
