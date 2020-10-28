@@ -42,6 +42,8 @@ Activations = Dict[int, Dict[int, Dict[int, Batch]]]
 Invocations = Dict[int, Invocation]
 
 
+ARO_INDICES = []
+
 @dataclass(frozen=True)
 class TailBackwardContext:
     activations: Activations
@@ -114,6 +116,8 @@ class AsyncRecvOperator(torch.autograd.Function):
             if t.dtype.is_floating_point:
                 return t.requires_grad_()
             return t
+        #global ARO_INDICES
+        #ARO_INDICES = []
 
         return tuple(maybe_requires_grad(r) for r in result.tensors)
 
@@ -125,6 +129,8 @@ class AsyncRecvOperator(torch.autograd.Function):
         body = AsyncMessageBody(
             AsyncMessageType.Gradients, ctx.index, source=ctx.args.dest, dest=ctx.args.source, order=ctx.args.order - 1
         )
+        #global ARO_INDICES
+        #ARO_INDICES.append(ctx.index)
         ctx.transport.send_message(
             PipeMessage(
                 this_rank, ranks[ctx.args.source.stage], queue_name=EVENT_LOOP_QUEUE, args=body, tensors=tuple(grad),
@@ -150,6 +156,9 @@ class AsyncRecvOperator(torch.autograd.Function):
                     )
         except Exception as e:
             print(f"fucaljkrlka {e}")
+
+        #if len(ARO_INDICES) == 10:
+        #    print(f"aro done {this_rank}")
 
         return (None, None, None, None, None)
 
@@ -419,6 +428,7 @@ class AsyncEventLoop:
             num_gradients = expected_invocations
 
         while num_activations < expected_invocations or num_gradients < expected_invocations:
+            print(f"eli {num_activations}, {num_gradients}, {expected_invocations}, {torch.distributed.get_rank()}")
             if num_activations == expected_invocations and num_gradients == 0 and event is not None:
                 # We are ready to do the backward pass, but must wait for
                 # PipeRPCWrapper to signal that it is safe to proceed, otherwise

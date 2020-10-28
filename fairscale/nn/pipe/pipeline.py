@@ -295,15 +295,15 @@ class Pipeline:
                 self.mp_partitions, self.group, self.transport, self.training, self.checkpoint_stop,
             )
             if rank == 0 and not self.final_stage:
-                print(f"{torch.distributed.get_rank()}: entered event head")
+                print(f"{torch.distributed.get_rank()}: entered event head {os.getpid()}")
                 event_loop.event_loop_head(batches, skip_trackers, event)
                 print(f"{torch.distributed.get_rank()}: exited event head")
             elif self.final_stage:
-                print(f"{torch.distributed.get_rank()}: entered event tail")
+                print(f"{torch.distributed.get_rank()}: entered event tail {os.getpid()}")
                 event_loop.event_loop_tail(batches, skip_trackers)
                 print(f"{torch.distributed.get_rank()}: exited event tail")
             else:
-                print(f"{torch.distributed.get_rank()}: entered event loop")
+                print(f"{torch.distributed.get_rank()}: entered event loop {os.getpid()}")
                 event_loop.event_loop(len(batches), skip_trackers)
                 print(f"{torch.distributed.get_rank()}: exited event loop")
 

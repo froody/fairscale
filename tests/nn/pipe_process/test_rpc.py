@@ -69,6 +69,7 @@ def check_pipe_against_reference(balance, model_constructor, checkpoint="except_
         dst.load_state_dict(copy.deepcopy(src.state_dict()))
 
     reference_model = nn.Sequential(*reference_model).cuda()
+    nbatch = 10
 
     pipe = PipeRPCWrapper(
         model,
@@ -76,14 +77,14 @@ def check_pipe_against_reference(balance, model_constructor, checkpoint="except_
         input_device=torch.cuda.current_device(),
         worker_map=get_worker_map(),
         checkpoint=checkpoint,
-        chunks=10,
+        chunks=nbatch,
     )
 
     pipe.foreach_worker(register_optimizer, include_self=True)
     register_optimizer(None, reference_model)
 
-    inputs = torch.rand(10, 10).cuda()
-    target = torch.rand(10, 10).cuda()
+    inputs = torch.rand(nbatch, 10).cuda()
+    target = torch.rand(nbatch, 10).cuda()
     cloned = inputs.clone()
     output = pipe(inputs)
     ref_out = reference_model(inputs)
