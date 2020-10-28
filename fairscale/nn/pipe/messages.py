@@ -107,6 +107,7 @@ class RpcTransport(Transport):
 
 class SendRecvTransport(Transport):
     def send_message(self, message: PipeMessage, sync: bool = False, skip_header: bool = False) -> None:
+        #print(f">>> send_msg {torch.distributed.get_rank()}")
         tensors = message.tensors
         message.tensors = tuple()
         torch.cuda.current_stream().synchronize()
@@ -125,8 +126,10 @@ class SendRecvTransport(Transport):
             torch.distributed.send(
                 t.contiguous(), message.dest, tag=message.tag + index, group=get_pipeline_parallel_group()
             )
+        #print(f"<<< send_msg {torch.distributed.get_rank()}")
 
     def recv_message_header(self, queue_name: int, nowait: bool = False) -> PipeMessage:
+        #print(f">>> recv_header {torch.distributed.get_rank()}")
         # FIXME(handle nowait)
         if nowait:
             raise QueueEmpty
@@ -134,9 +137,11 @@ class SendRecvTransport(Transport):
         torch.cuda.current_stream().synchronize()
         torch.distributed.recv(tensor, src=None, tag=queue_name, group=get_pipeline_parallel_group())
         torch.cuda.current_stream().synchronize()
+        #print(f"<<< recv_header {torch.distributed.get_rank()}")
         return tensor_to_pyobject(tensor)
 
     def recv_message_tensors(self, message: PipeMessage) -> PipeMessage:
+        #print(f">>> recv_message {torch.distributed.get_rank()}")
         torch.cuda.current_stream().synchronize()
 
         message_tensors = []
@@ -148,6 +153,7 @@ class SendRecvTransport(Transport):
         message.tensors = tuple(message_tensors)
 
         torch.cuda.current_stream().synchronize()
+        ##print(f"<<< recv_message {torch.distributed.get_rank()}")
         return message
 
     def get_out_of_order(self, queue_name: int, index: int) -> Tensors:
