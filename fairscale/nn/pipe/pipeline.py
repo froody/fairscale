@@ -296,7 +296,7 @@ class Pipeline:
             )
             if rank == 0 and not self.final_stage:
                 print(f"{torch.distributed.get_rank()}: entered event head {os.getpid()}")
-                event_loop.event_loop_head(batches, skip_trackers, event)
+                self.head_ctx = event_loop.event_loop_head(batches, skip_trackers, event)
                 print(f"{torch.distributed.get_rank()}: exited event head")
             elif self.final_stage:
                 print(f"{torch.distributed.get_rank()}: entered event tail {os.getpid()}")
@@ -553,6 +553,10 @@ class Pipeline:
 
     def back_helper(self, output: List[Batch]) -> None:
         if self.style == PipelineStyle.AsyncSchedule:
+            event_loop = AsyncEventLoop(
+                self.mp_partitions, self.group, self.transport, self.training, self.checkpoint_stop,
+            )
+            event_loop.head_backwards(self.head_ctx)
             return
 
         o = list(output)

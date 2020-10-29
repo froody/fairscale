@@ -128,15 +128,18 @@ class SendRecvTransport(Transport):
             )
         #print(f"<<< send_msg {torch.distributed.get_rank()}")
 
-    def recv_message_header(self, queue_name: int, nowait: bool = False) -> PipeMessage:
+    def recv_message_header(self, queue_name: int, nowait: bool = False, future=None) -> PipeMessage:
         #print(f">>> recv_header {torch.distributed.get_rank()}")
         # FIXME(handle nowait)
         if nowait:
             raise QueueEmpty
-        tensor = torch.empty(MESSAGE_TENSOR_SIZE, dtype=torch.uint8, device=self.input_device)
-        torch.cuda.current_stream().synchronize()
-        torch.distributed.recv(tensor, src=None, tag=queue_name, group=get_pipeline_parallel_group())
-        torch.cuda.current_stream().synchronize()
+        if future:
+            tensor = future
+        else:
+            tensor = torch.empty(MESSAGE_TENSOR_SIZE, dtype=torch.uint8, device=self.input_device)
+            torch.cuda.current_stream().synchronize()
+            torch.distributed.recv(tensor, src=None, tag=queue_name, group=get_pipeline_parallel_group())
+            torch.cuda.current_stream().synchronize()
         #print(f"<<< recv_header {torch.distributed.get_rank()}")
         return tensor_to_pyobject(tensor)
 

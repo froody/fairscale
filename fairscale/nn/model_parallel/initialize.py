@@ -22,7 +22,7 @@
 
 """Model and data parallel groups."""
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -36,6 +36,9 @@ _DATA_PARALLEL_GROUP = None
 _PIPELINE_PARALLEL_GROUP = None
 
 _PIPELINE_PARALLEL_RANKS = None
+
+_MODEL_PARALLEL_RANKS_PREV = None
+_MODEL_PARALLEL_RANKS_NEXT = None
 
 
 def initialize_model_parallel(
@@ -97,11 +100,20 @@ def initialize_model_parallel(
     # Build the model parallel groups.
     global _MODEL_PARALLEL_GROUP
     assert _MODEL_PARALLEL_GROUP is None, "model parallel group is already initialized"
+    global _MODEL_PARALLEL_RANKS_PREV
+    global _MODEL_PARALLEL_RANKS_NEXT
+    assert _MODEL_PARALLEL_RANKS_PREV is None
+    assert _MODEL_PARALLEL_RANKS_NEXT is None
     for i in range(data_parallel_size):
         for j in range(pipeline_length):
-            group = torch.distributed.new_group(groups[i, j, :].tolist(), backend=model_parallel_backend)
+            ranks = groups[i, j, :].tolist()
+            group = torch.distributed.new_group(ranks, backend=model_parallel_backend)
             if i == found[0] and j == found[1]:
                 _MODEL_PARALLEL_GROUP = group
+            elif i == found[0] and j + 1 == found[1]:
+                _MODEL_PARALLEL_RANKS_PREV = ranks
+            elif i == found[0] and j == found[1] + 1:
+                _MODEL_PARALLEL_RANKS_NEXT = ranks
 
     global _PIPELINE_PARALLEL_GROUP
     assert _PIPELINE_PARALLEL_GROUP is None, "model parallel group is already initialized"
@@ -157,6 +169,11 @@ def get_model_parallel_rank() -> int:
     return torch.distributed.get_rank(group=get_model_parallel_group())
 
 
+def get_model_parallel_prev_next_ranks() -> Tuple[List[int], List[int]]:
+    assert _MODEL_PARALLEL_GROUP is not None, "model parallel group is not initialized"
+    return (_MODEL_PARALLEL_RANKS_PREV, _MODEL_PARALLEL_RANKS_NEXT)
+
+
 def get_model_parallel_src_rank() -> int:
     """Calculate the global rank corresponding to a local rank zero
     in the model parallel group."""
@@ -186,3 +203,8 @@ def destroy_model_parallel() -> None:
 
     global _PIPELINE_PARALLEL_RANKS
     _PIPELINE_PARALLEL_RANKS = None
+
+    global _MODEL_PARALLEL_RANKS_PREV
+    global _MODEL_PARALLEL_RANKS_NEXT
+    _MODEL_PARALLEL_RANKS_PREV = None
+    _MODEL_PARALLEL_RANKS_NEXT = None

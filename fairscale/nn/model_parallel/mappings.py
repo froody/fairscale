@@ -27,6 +27,9 @@ from .initialize import get_model_parallel_group
 from .utils import split_tensor_along_last_dim
 
 
+import os
+cactus = open("/private/home/tbirch/src/fairscale/debug-meg-" + os.environ["OMPI_COMM_WORLD_RANK"], "w", buffering=1)
+
 def _reduce(ctx: Any, input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the the input tensor across model parallel group."""
     group = get_model_parallel_group()
@@ -39,7 +42,9 @@ def _reduce(ctx: Any, input_: torch.Tensor) -> torch.Tensor:
         return input_
 
     # All-reduce.
+    print(">>> all_reduce", file=cactus)
     torch.distributed.all_reduce(input_, group=group)
+    print("<<< all_reduce", file=cactus)
 
     return input_
 
@@ -79,7 +84,9 @@ def _gather(input_: torch.Tensor) -> torch.Tensor:
 
     tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
     tensor_list[rank] = input_
+    print(">>> all_gather", file=cactus)
     torch.distributed.all_gather(tensor_list, input_, group=group)
+    print("<<< all_gather", file=cactus)
 
     # Note: torch.cat already creates a contiguous tensor.
     output = torch.cat(tensor_list, dim=last_dim).contiguous()

@@ -62,6 +62,10 @@ def dist_init(rank, world_size, hostname=None):
     os.environ["MASTER_PORT"] = "10638"
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["RANK"] = str(rank)
+    import torch_ug
+
+    torch_ug.init_nccl()
+    print(f"using mandeep nccl")
 
     if version.parse(torch.__version__).release >= (1, 6, 0):
         init_method = f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}"
@@ -80,8 +84,9 @@ def dist_init(rank, world_size, hostname=None):
             f"Test{rank}",
             rank=rank,
             world_size=world_size,
-            backend=rpc.BackendType.TENSORPIPE,
-            rpc_backend_options=rpc.TensorPipeRpcBackendOptions(init_method=init_method),
+            # backend=rpc.BackendType.TENSORPIPE,
+            # rpc_backend_options=rpc.TensorPipeRpcBackendOptions(init_method=init_method),
+            rpc_backend_options=rpc.ProcessGroupRpcBackendOptions(init_method=init_method),
         )
     else:
         if world_size > 1:
@@ -152,6 +157,11 @@ def torch_spawn(world_sizes=None):
 
             error_queue = multiprocessing.get_context("spawn").SimpleQueue()
             if "OMPI_COMM_WORLD_RANK" in os.environ:
+                import torch_pg
+
+                #torch_pg.init_nccl()
+                torch_pg.init_mpi()
+                print(f"using mandeep mpi {torch.cuda.is_available()} {torch.cuda.device_count()}")
                 os.environ["RANK"] = os.environ["OMPI_COMM_WORLD_RANK"]
                 os.environ["WORLD_SIZE"] = os.environ["OMPI_COMM_WORLD_SIZE"]
                 os.environ["MASTER_ADDR"] = "localhost"

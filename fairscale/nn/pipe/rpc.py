@@ -53,12 +53,13 @@ def get_global_ranks_from_group(group: ProcessGroup) -> List[int]:
 class PipeBackRedirect(torch.autograd.Function):
     @staticmethod
     # type: ignore
-    def forward(ctx, inputs, dest, event, message, transport, futures):
+    def forward(ctx, inputs, dest, event, message, transport, futures, model):
         ctx.dest = dest
         ctx.event = event
         ctx.message = message
         ctx.transport = transport
         ctx.futures = futures
+        ctx.model = model
         return inputs
 
     @staticmethod
@@ -67,8 +68,10 @@ class PipeBackRedirect(torch.autograd.Function):
         ctx.message.tensors = tuple(grad)
         ctx.transport.send_message(ctx.message, sync=False, skip_header=True)
         ctx.event.set()
+        ctx.model.back_helper([])
+
         # torch.futures.wait_all(ctx.futures)
-        return (None, None, None, None, None, None)
+        return (None, None, None, None, None, None, None)
 
 
 def callback_with_model(callback: Callable[[Any, Pipe], None], ctx: Any) -> None:
@@ -166,8 +169,11 @@ class PipeRPCWrapper(nn.Module):
             return self.model(tensor)
         else:
             event = Event()
-            t = Thread(target=self._model_forward_first_stage, args=(tensor, event))
-            t.start()
+            #t = Thread(target=self._model_forward_first_stage, args=(tensor, event))
+            #t.start()
+            #self._model_forward_first_stage(tensor, event)
+
+            self.model(tensor, event=event)
 
             shape, dtype = futures.pop().wait()
             dest_rank = self.group.size() - 1
@@ -194,7 +200,7 @@ class PipeRPCWrapper(nn.Module):
 
             assert self.model.pipeline
             return PipeBackRedirect.apply(
-                result, dest_global_rank, event, grads, self.model.pipeline.transport, futures
+                result, dest_global_rank, event, grads, self.model.pipeline.transport, futures, self.model
             )
 
     @property
