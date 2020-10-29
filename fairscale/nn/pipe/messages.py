@@ -133,8 +133,9 @@ class SendRecvTransport(Transport):
         # FIXME(handle nowait)
         if nowait:
             raise QueueEmpty
-        if future:
+        if future is not None:
             tensor = future
+            torch.cuda.current_stream().synchronize()
         else:
             tensor = torch.empty(MESSAGE_TENSOR_SIZE, dtype=torch.uint8, device=self.input_device)
             torch.cuda.current_stream().synchronize()

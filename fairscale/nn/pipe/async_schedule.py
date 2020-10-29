@@ -28,6 +28,8 @@ from .types import EVENT_LOOP_QUEUE, PipelineStyle, PipeMessage, Tensors
 
 import os
 
+from inspect import currentframe, getframeinfo
+
 cactus = open("/private/home/tbirch/src/fairscale/debug-" + os.environ["OMPI_COMM_WORLD_RANK"], "w", buffering=1)
 
 
@@ -323,23 +325,6 @@ class AsyncEventLoop:
 
         count_per_order = dict()
 
-        tensor = torch.empty(MESSAGE_TENSOR_SIZE, dtype=torch.uint8, device=self.transport.input_device)
-        global G_WORK_ITEM
-        if any(inv.source and inv.source.stage != self.group.rank() for inv in invocations.values()):
-            print(f"yay work_itemm")
-            work_item = torch.distributed.irecv(tensor, src=None, tag=EVENT_LOOP_QUEUE, group=self.group)
-            G_WORK_ITEM = work_item
-        else:
-            print(f"no work_itemm")
-            G_WORK_ITEM = None
-
-        for batch in batches:
-            inv_count, last_order = self.run_invocations_on_batch(batch, invocations, 0, skip_trackers, activations)
-            actual_invocations += inv_count
-            count_per_order[last_order] = inv_count
-            if G_WORK_ITEM and G_WORK_ITEM.is_completed():
-                print(f"available yay")
-
         if actual_invocations < expected_invocations:
             self.event_loop_inner(
                 expected_invocations,
@@ -350,7 +335,7 @@ class AsyncEventLoop:
                 already_received=actual_invocations,
                 event=event,
                 ignore_gradients=True,
-                future=(G_WORK_ITEM, tensor) if G_WORK_ITEM is not None else None,
+                batches=batches,
             )
 
         if self.training:
@@ -483,7 +468,6 @@ class AsyncEventLoop:
         ignore_gradients: bool = False,
         event: Optional[Event] = None,
         tail: bool = False,
-        future=None,
     ) -> None:
         """The common event loop shared by all stages. This processses
         activations for the forward pass, and if `self.training` is true,
@@ -497,22 +481,24 @@ class AsyncEventLoop:
 
         stashed_messages = {}
         batch_iter = iter(batches) if batches else None
+        num_batches = expected_invocations / len(invocations)
 
-        tensor = torch.empty(MESSAGE_TENSOR_SIZE, dtype=torch.uint8, device=self.transport.input_device)
-        will_receive_activations =  any(inv.source and inv.source.stage != self.group.rank() for inv in invocations.values())
+        message_tensor = torch.empty(MESSAGE_TENSOR_SIZE, dtype=torch.uint8, device=self.transport.input_device)
+        will_receive_activations = (
+            any(inv.source and inv.source.stage != self.group.rank() for inv in invocations.values())
+            and batches is not None
+        )
+        gr = get_model_parallel_group()
 
-        if will_receive_activations:
+        if will_receive_activations and gr.rank() == 0 and num_activations < expected_invocations:
             print(f"yay work_itemm")
-            work_item = torch.distributed.irecv(tensor, src=None, tag=EVENT_LOOP_QUEUE, group=self.group)
+            work_item = torch.distributed.irecv(message_tensor, src=None, tag=EVENT_LOOP_QUEUE, group=self.group)
         else:
             work_item = None
 
-        for batch in batches:
-            inv_count, last_order = self.run_invocations_on_batch(batch, invocations, 0, skip_trackers, activations)
-            actual_invocations += inv_count
-            count_per_order[last_order] = inv_count
-            if G_WORK_ITEM and G_WORK_ITEM.is_completed():
-                print(f"available yay")
+        processed_batch_count = 0
+
+        inv_per_batch = 0
 
         while num_activations < expected_invocations or num_gradients < expected_invocations:
             print(f"eli {num_activations}, {num_gradients}, {expected_invocations}, {torch.distributed.get_rank()}")
@@ -522,21 +508,36 @@ class AsyncEventLoop:
                 # deadlock
                 pass  # event.wait()
 
-
-            gr = get_model_parallel_group()
-
             message = None
+            inv_order = None
+            microbatch_index = None
+            batch = None
+            message_type = None
 
             if gr.rank() == 0:
                 if batch_iter and work_item and work_item.is_completed():
-                        
 
-                message = self.transport.recv_message_header(EVENT_LOOP_QUEUE, future=future)
-                future = None
+                    work_item.wait()
+                    message = self.transport.recv_message_header(EVENT_LOOP_QUEUE, future=message_tensor)
+                    args: AsyncMessageBody = message.args
+                    message_type = args.message_type
+                    inv_order = args.order
+                    microbatch_index = args.microbatch_index
+                    work_item = None
+                elif batch_iter and processed_batch_count < num_batches:
+                    batch = next(batch_iter)
+                    processed_batch_count += 1
+                    inv_order = 0
+                    microbatch_index = batch.index
+                    message_type = AsyncMessageType.Activations
+                else:
+                    message = self.transport.recv_message_header(EVENT_LOOP_QUEUE)
+                    args: AsyncMessageBody = message.args
+                    message_type = args.message_type
+                    inv_order = args.order
+                    microbatch_index = args.microbatch_index
 
-                args: AsyncMessageBody = message.args
-
-                sequence = torch.tensor([args.order, args.microbatch_index]).cuda()
+                sequence = torch.tensor([inv_order, microbatch_index]).cuda()
                 with torch.cuda.stream(self.broadcast_stream):
                     print(f">>> broadcast", file=cactus)
                     torch.distributed.broadcast(sequence, src=_get_global_rank(gr, 0), group=gr)
@@ -545,7 +546,7 @@ class AsyncEventLoop:
             else:
                 sequence = torch.tensor([0, 0]).cuda()
                 if len(stashed_messages) == 0:
-                    message = self.transport.recv_message_header(EVENT_LOOP_QUEUE, future=future)
+                    message = None  # self.transport.recv_message_header(EVENT_LOOP_QUEUE, future=future)
                     future = None
 
                 with torch.cuda.stream(self.broadcast_stream):
@@ -561,41 +562,54 @@ class AsyncEventLoop:
 
                     if message:
                         args = message.args
+                    elif batch_iter and expected_sequence == (0, processed_batch_count):
+                        batch = next(batch_iter)
+                        processed_batch_count += 1
+                        inv_order = 0
+                        microbatch_index = batch.index
+                        message_type = AsyncMessageType.Activations
+                        break
                     else:
                         message = self.transport.recv_message_header(EVENT_LOOP_QUEUE)
                         args: AsyncMessageBody = message.args
 
                     st = (args.order, args.microbatch_index)
                     if st != expected_sequence:
-                        print(f"ooo")
                         stashed_messages[st] = message
                         message = None
                     else:
                         if st in stashed_messages:
                             del stashed_messages[st]
+                        inv_order = args.order
+                        microbatch_index = args.microbatch_index
+                        message_type = args.message_type
                         break
 
-            torch.distributed.barrier(group=gr)
+            # torch.distributed.barrier(group=gr)
             try:
-                assert sequence[0] == args.order
-                assert sequence[1] == args.microbatch_index
+                assert sequence[0] == inv_order
+                assert sequence[1] == microbatch_index
             except Exception as e:
-                print(f"asssert {sequence}, {[args.order, args.microbatch_index]}")
+                print(f"asssert {sequence}, {[inv_order, args.microbatch_index]}")
                 raise e
 
-            invocation = invocations[args.order]
+            invocation = invocations[inv_order]
 
             # FIXME(tom) for combining pipeline with megatron, I currently don't
             # control the order of received activations or gradients, so it is
             # possible for a reused ColumnParallelLinear for example to receive
             # a different order of activations w.r.t. the sending stage, which
             # would result in incorrect values being used for the all_gather
-            if args.message_type is AsyncMessageType.Activations:
-                batch = self.get_batch_from_message(message)
+            if message_type is AsyncMessageType.Activations:
+                if batch is None:
+                    batch = self.get_batch_from_message(message)
 
                 inv_count, last_order = self.run_invocations_on_batch(
-                    batch, invocations, args.order, skip_trackers, activations
+                    batch, invocations, inv_order, skip_trackers, activations
                 )
+                if inv_order == 0:
+                    inv_per_batch = inv_count
+
                 count_per_order[last_order] = inv_count
                 num_activations += inv_count
                 try:
@@ -608,7 +622,17 @@ class AsyncEventLoop:
                 except Exception as e:
                     print(f"fucaljkrlka {e}")
 
-            elif args.message_type is AsyncMessageType.Gradients:
+                if (
+                    work_item is None
+                    and will_receive_activations
+                    and gr.rank() == 0
+                    and expected_invocations - num_activations > (num_batches - processed_batch_count) * inv_per_batch
+                ):
+                    work_item = torch.distributed.irecv(
+                        message_tensor, src=None, tag=EVENT_LOOP_QUEUE, group=self.group
+                    )
+
+            elif message_type is AsyncMessageType.Gradients:
                 num_gradients += count_per_order[invocation.order]
                 self.perform_backward_for_invocation(self.transport, message, activations, invocation)
 
