@@ -3,7 +3,6 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-from threading import Event, Lock, Thread
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
 
 import torch
@@ -53,9 +52,8 @@ def get_global_ranks_from_group(group: ProcessGroup) -> List[int]:
 class PipeBackRedirect(torch.autograd.Function):
     @staticmethod
     # type: ignore
-    def forward(ctx, inputs, dest, event, message, transport, futures, model):
+    def forward(ctx, inputs, dest, message, transport, futures, model):
         ctx.dest = dest
-        ctx.event = event
         ctx.message = message
         ctx.transport = transport
         ctx.futures = futures
@@ -67,27 +65,18 @@ class PipeBackRedirect(torch.autograd.Function):
     def backward(ctx, *grad):
         ctx.message.tensors = tuple(grad)
         ctx.transport.send_message(ctx.message, sync=False, skip_header=True)
-        ctx.event.set()
         ctx.model.back_helper([])
 
-        # torch.futures.wait_all(ctx.futures)
-        return (None, None, None, None, None, None, None)
+        torch.futures.wait_all(ctx.futures)
+        return (None, None, None, None, None, None)
 
 
 def callback_with_model(callback: Callable[[Any, Pipe], None], ctx: Any) -> None:
-    print(f">>>> callback_with_model {torch.distributed.get_rank()}, {callback}")
-    try:
-        group = get_pipeline_parallel_group()  # FIXME(tom) handle dynamic group
-        set_device_based_on_group(group)
+    group = get_pipeline_parallel_group()  # FIXME(tom) handle dynamic group
+    set_device_based_on_group(group)
 
-        print(f"callback_with_model try lock ")
-        with PipeModel.lock:
-            print(f"callback_with_model got lock ")
-            callback(ctx, PipeModel)
-    except BaseException as e:
-        print(f"callback_with_model an exception")
-        print(f"callback_with_model got {e}")
-    print(f"<<<< callback_with_model {torch.distributed.get_rank()}")
+    with PipeModel.lock:
+        callback(ctx, PipeModel)
 
 
 class PipeRPCWrapper(nn.Module):
@@ -103,7 +92,6 @@ class PipeRPCWrapper(nn.Module):
         super().__init__()
         self.group = cast(ProcessGroup, kwargs.get("group")) or get_pipeline_parallel_group()
         assert self.group.rank() == 0
-        self.lock = Lock()
 
         if True:
             assert (
@@ -168,12 +156,7 @@ class PipeRPCWrapper(nn.Module):
         if self.model.final_stage:
             return self.model(tensor)
         else:
-            event = Event()
-            #t = Thread(target=self._model_forward_first_stage, args=(tensor, event))
-            #t.start()
-            #self._model_forward_first_stage(tensor, event)
-
-            self.model(tensor, event=event)
+            self.model(tensor)
 
             shape, dtype = futures.pop().wait()
             dest_rank = self.group.size() - 1
@@ -190,7 +173,6 @@ class PipeRPCWrapper(nn.Module):
             )
             futures.append(back_fut)
 
-            print(f"recv result")
             result = self._recv_result(self.model, shape, dtype, activations)
             if isinstance(result, torch.Tensor):
                 result.requires_grad_()
@@ -200,7 +182,7 @@ class PipeRPCWrapper(nn.Module):
 
             assert self.model.pipeline
             return PipeBackRedirect.apply(
-                result, dest_global_rank, event, grads, self.model.pipeline.transport, futures, self.model
+                result, dest_global_rank, grads, self.model.pipeline.transport, futures, self.model
             )
 
     @property
@@ -228,34 +210,26 @@ class PipeRPCWrapper(nn.Module):
 
     @staticmethod
     def _send_result_and_do_backwards(training: bool, message: PipeMessage, grads_message: PipeMessage) -> None:
-        try:
-            group = get_pipeline_parallel_group()
-            set_device_based_on_group(group)
-            result = PipeResult
-            model = PipeModel
+        group = get_pipeline_parallel_group()
+        set_device_based_on_group(group)
+        result = PipeResult
+        model = PipeModel
 
-            if isinstance(result, torch.Tensor):
-                result = tuple([result])
+        if isinstance(result, torch.Tensor):
+            result = tuple([result])
 
-            message.tensors = tuple(result)
-            assert model.pipeline
-            transport = model.pipeline.transport
-            print(f">>> send_result...")
-            transport.send_message(message, sync=False, skip_header=True)
-            print(f"<<< send_result...")
+        message.tensors = tuple(result)
+        assert model.pipeline
+        transport = model.pipeline.transport
+        transport.send_message(message, sync=False, skip_header=True)
 
-            if training:
-                grads_message.tensor_shapes = [r.shape for r in result]
-                grads_message.tensor_dtypes = [r.dtype for r in result]
-                grads_message = transport.recv_message_tensors(grads_message)
+        if training:
+            grads_message.tensor_shapes = [r.shape for r in result]
+            grads_message.tensor_dtypes = [r.dtype for r in result]
+            grads_message = transport.recv_message_tensors(grads_message)
 
-                with model.lock:
-                    print(f">>> autograd...")
-                    torch.autograd.backward(result, grads_message.tensors, retain_graph=True)
-                    print(f"<<< autograd...")
-        except Exception as e:
-            print(f"fjdalkfjasld {e}")
-            raise e
+            with model.lock:
+                torch.autograd.backward(result, grads_message.tensors, retain_graph=True)
 
     @staticmethod
     def _register_remote_model(args: List[Any], kwargs: Dict[str, Any]) -> None:
@@ -272,34 +246,20 @@ class PipeRPCWrapper(nn.Module):
     def _model_forward(
         training: bool, shape: torch.Size, dtype: torch.dtype
     ) -> Optional[Tuple[SizeOrSizes, DtypeOrDtypes]]:
-        try:
-            model = PipeModel
-            assert model.group
-            set_device_based_on_group(model.group)
+        model = PipeModel
+        assert model.group
+        set_device_based_on_group(model.group)
 
-            if isinstance(shape, torch.Size):
-                tensor = torch.empty(shape, dtype=dtype)
-            else:
-                tensor = tuple([torch.empty(s, dtype=d) for s, d in zip(shape, dtype)])
+        if isinstance(shape, torch.Size):
+            tensor = torch.empty(shape, dtype=dtype)
+        else:
+            tensor = tuple([torch.empty(s, dtype=d) for s, d in zip(shape, dtype)])
 
+        model.train(training)
+        result = model(tensor)
+        if model.final_stage:
+            global PipeResult
+            PipeResult = result
+            return (get_shapes(result), get_dtype(result))
 
-            model.train(training)
-            result = model(tensor)
-            if model.final_stage:
-                global PipeResult
-                PipeResult = result
-                return (get_shapes(result), get_dtype(result))
-
-            return None
-        except Exception as e:
-            print(f"_model_forward got {e}")
-
-    def _model_forward_first_stage(self, tensor: TensorOrTensors, event: Event) -> None:
-        print(f">>> mfffs")
-        try:
-            assert self.model.group
-            set_device_based_on_group(self.model.group)
-            self.model(tensor, event=event)
-        except Exception as e:
-            print(f"_model_forward got {e}")
-        print(f"<<< mfffs")
+        return None

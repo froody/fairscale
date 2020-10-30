@@ -62,10 +62,10 @@ def dist_init(rank, world_size, hostname=None):
     os.environ["MASTER_PORT"] = "10638"
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["RANK"] = str(rank)
-    import torch_ug
+    #import torch_pg
 
-    torch_ug.init_nccl()
-    print(f"using mandeep nccl")
+    #torch_pg.init_nccl()
+    #print(f"using mandeep nccl")
 
     if version.parse(torch.__version__).release >= (1, 6, 0):
         init_method = f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}"
@@ -115,6 +115,10 @@ def spawn_for_all_world_sizes(test_func, world_sizes=get_world_sizes(), args=[])
 def worker_process(rank, world_size, func, args, error_queue):
     """Main function for unit tests launced with torch_spawn"""
 
+    print(f"spanwend {os.getpid()}")
+    import time
+    #time.sleep(10)
+
     dist_init(rank, world_size)
     kwargs = {}
     if "OMPI_COMM_WORLD_RANK" not in os.environ:
@@ -157,10 +161,10 @@ def torch_spawn(world_sizes=None):
 
             error_queue = multiprocessing.get_context("spawn").SimpleQueue()
             if "OMPI_COMM_WORLD_RANK" in os.environ:
-                import torch_pg
+                #import torch_pg
 
                 #torch_pg.init_nccl()
-                torch_pg.init_mpi()
+                #torch_pg.init_mpi()
                 print(f"using mandeep mpi {torch.cuda.is_available()} {torch.cuda.device_count()}")
                 os.environ["RANK"] = os.environ["OMPI_COMM_WORLD_RANK"]
                 os.environ["WORLD_SIZE"] = os.environ["OMPI_COMM_WORLD_SIZE"]

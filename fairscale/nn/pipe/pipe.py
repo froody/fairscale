@@ -791,9 +791,7 @@ class PipelinedBackwardPass(torch.autograd.Function):
         for grad, batch in reversed(list(zip(grad_batches, ctx.batches))):
             for t in batch:
                 t.retain_grad()
-            print(f">>> backward for {batch.index}")
             torch.autograd.backward(batch.tensor_or_tensors, grad_tensors=(*grad,), retain_graph=ctx.retain_graph)
-            print(f"<<< backward for {batch.index}")
 
         with torch.no_grad():
             if ctx.batches[0].atomic:

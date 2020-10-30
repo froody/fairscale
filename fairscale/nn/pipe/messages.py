@@ -6,10 +6,12 @@
 from abc import ABC
 from queue import Empty as QueueEmpty
 from queue import Queue
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from dataclasses import dataclass
 import torch
+
+from torch.distributed.distributed_c10d import _get_global_rank
 
 from fairscale.nn.model_parallel import get_pipeline_parallel_group
 from fairscale.utils.object import pyobject_to_tensor, tensor_to_pyobject
@@ -104,10 +106,16 @@ class RpcTransport(Transport):
             else:
                 out_of_order.append(message)
 
+    def send_sequence(self, sequence: Tuple[int, int], group: torch.distributed.ProcessGroup) -> None:
+        pass
+
+    def recv_sequence(self, group: torch.distributed.ProcessGroup) -> Tuple[int, int]:
+        return (0, 0)
+
 
 class SendRecvTransport(Transport):
     def send_message(self, message: PipeMessage, sync: bool = False, skip_header: bool = False) -> None:
-        #print(f">>> send_msg {torch.distributed.get_rank()}")
+        # print(f">>> send_msg {torch.distributed.get_rank()}")
         tensors = message.tensors
         message.tensors = tuple()
         torch.cuda.current_stream().synchronize()
@@ -126,10 +134,10 @@ class SendRecvTransport(Transport):
             torch.distributed.send(
                 t.contiguous(), message.dest, tag=message.tag + index, group=get_pipeline_parallel_group()
             )
-        #print(f"<<< send_msg {torch.distributed.get_rank()}")
+        # print(f"<<< send_msg {torch.distributed.get_rank()}")
 
     def recv_message_header(self, queue_name: int, nowait: bool = False, future=None) -> PipeMessage:
-        #print(f">>> recv_header {torch.distributed.get_rank()}")
+        # print(f">>> recv_header {torch.distributed.get_rank()}")
         # FIXME(handle nowait)
         if nowait:
             raise QueueEmpty
@@ -141,11 +149,11 @@ class SendRecvTransport(Transport):
             torch.cuda.current_stream().synchronize()
             torch.distributed.recv(tensor, src=None, tag=queue_name, group=get_pipeline_parallel_group())
             torch.cuda.current_stream().synchronize()
-        #print(f"<<< recv_header {torch.distributed.get_rank()}")
+        # print(f"<<< recv_header {torch.distributed.get_rank()}")
         return tensor_to_pyobject(tensor)
 
     def recv_message_tensors(self, message: PipeMessage) -> PipeMessage:
-        #print(f">>> recv_message {torch.distributed.get_rank()}")
+        # print(f">>> recv_message {torch.distributed.get_rank()}")
         torch.cuda.current_stream().synchronize()
 
         message_tensors = []
@@ -167,3 +175,17 @@ class SendRecvTransport(Transport):
         message = self.recv_message(queue_name)
         assert message.args == index
         return message.tensors
+
+    def send_sequence(self, sequence: Tuple[int, int], group: torch.distributed.ProcessGroup) -> None:
+        assert group.rank() == 0
+        tensor = torch.tensor(sequence, device=self.input_device)
+        torch.cuda.current_stream().synchronize()
+        for rank in range(1, group.size()):
+            torch.distributed.send(tensor, _get_global_rank(group, rank), tag=1, group=group)
+
+    def recv_sequence(self, group: torch.distributed.ProcessGroup) -> Tuple[int, int]:
+        assert group.rank() != 0
+        tensor = torch.tensor([0, 0], device=self.input_device)
+        torch.distributed.recv(tensor, _get_global_rank(group, 0), tag=1, group=group)
+        torch.cuda.current_stream().synchronize()
+        return tuple(tensor.tolist())

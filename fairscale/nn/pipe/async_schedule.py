@@ -30,8 +30,6 @@ import os
 
 from inspect import currentframe, getframeinfo
 
-cactus = open("/private/home/tbirch/src/fairscale/debug-" + os.environ["OMPI_COMM_WORLD_RANK"], "w", buffering=1)
-
 
 @dataclass(frozen=True)
 class Location:
@@ -52,11 +50,6 @@ class Invocation:
 
 Activations = Dict[int, Dict[int, Dict[int, Batch]]]
 Invocations = Dict[int, Invocation]
-
-
-ARO_INDICES = []
-
-G_WORK_ITEM = None
 
 
 @dataclass(frozen=True)
@@ -132,9 +125,6 @@ class AsyncRecvOperator(torch.autograd.Function):
                 return t.requires_grad_()
             return t
 
-        # global ARO_INDICES
-        # ARO_INDICES = []
-
         return tuple(maybe_requires_grad(r) for r in result.tensors)
 
     @staticmethod
@@ -146,8 +136,6 @@ class AsyncRecvOperator(torch.autograd.Function):
             AsyncMessageType.Gradients, ctx.index, source=ctx.args.dest, dest=ctx.args.source, order=ctx.args.order - 1
         )
 
-        # global ARO_INDICES
-        # ARO_INDICES.append(ctx.index)
         ctx.transport.send_message(
             PipeMessage(
                 this_rank, ranks[ctx.args.source.stage], queue_name=EVENT_LOOP_QUEUE, args=body, tensors=tuple(grad),
@@ -155,29 +143,22 @@ class AsyncRecvOperator(torch.autograd.Function):
             sync=True,
         )
 
-        try:
-            tail_ctx = getattr(ctx, "tail_ctx", None)
-            if tail_ctx:
-                expected_gradients = tail_ctx.expected_gradients
-                print(f"tail ctx expected_gradients {expected_gradients}")
-                while expected_gradients > 0:
-                    message = ctx.transport.recv_message_header(EVENT_LOOP_QUEUE)
+        tail_ctx = getattr(ctx, "tail_ctx", None)
+        if tail_ctx:
+            expected_gradients = tail_ctx.expected_gradients
+            while expected_gradients > 0:
+                message = ctx.transport.recv_message_header(EVENT_LOOP_QUEUE)
 
-                    args: AsyncMessageBody = message.args
-                    assert args.message_type is AsyncMessageType.Gradients
+                args: AsyncMessageBody = message.args
+                assert args.message_type is AsyncMessageType.Gradients
 
-                    invocation = tail_ctx.invocations[args.order]
-                    expected_gradients -= tail_ctx.count_per_order[invocation.order]
-                    recvd_grads = ctx.transport.recv_message_tensors(message)
+                invocation = tail_ctx.invocations[args.order]
+                expected_gradients -= tail_ctx.count_per_order[invocation.order]
+                recvd_grads = ctx.transport.recv_message_tensors(message)
 
-                    AsyncEventLoop.perform_backward_for_invocation(
-                        ctx.transport, message, recvd_grads, tail_ctx.activations, invocation
-                    )
-        except Exception as e:
-            print(f"fucaljkrlka {e}")
-
-        # if len(ARO_INDICES) == 10:
-        #    print(f"aro done {this_rank}")
+                AsyncEventLoop.perform_backward_for_invocation(
+                    ctx.transport, message, recvd_grads, tail_ctx.activations, invocation
+                )
 
         return (None, None, None, None, None)
 
@@ -196,8 +177,6 @@ class AsyncEventLoop:
         self.transport = transport
         self.group = group
         self.partitions: List[ModuleWrapper] = partitions
-        # self.broadcast_stream = torch.cuda.Stream()
-        self.broadcast_stream = torch.cuda.current_stream()
 
     def send_async_message(self, dst_rank: int, result: Batch, invocation: Invocation) -> Batch:
         """Send batch to dst_rank, and use AutogradWithoutActivations to delete
@@ -261,7 +240,6 @@ class AsyncEventLoop:
         then calling `backward` on the tensor"""
 
         # recvd_grads = transport.recv_message_tensors(message)
-        print(f"{invocation.this.index}, {invocation.order}, {message.args.microbatch_index}", file=cactus)
 
         batch: Batch = activations[invocation.this.index][invocation.order][message.args.microbatch_index]
 
@@ -293,20 +271,16 @@ class AsyncEventLoop:
             if invocation.order == order:
                 invocations_handled += 1
                 last_order = invocation.order
-                print(f">>> forward {pi}, {invocation.order}, {batch.index}", file=cactus)
                 activations[pi][invocation.order][batch.index] = self.run_invocation(
                     batch, partition, skip_trackers, invocation
                 )
-                print(f"<<< forward {pi}, {invocation.order}, {batch.index}", file=cactus)
             elif invocation.source and invocation.source.stage == self.group.rank():
                 invocations_handled += 1
                 last_order = invocation.order
                 batch = activations[invocation.source.index][invocation.order - 1][batch.index]
-                print(f">>> forward {pi}, {invocation.order}, {batch.index}", file=cactus)
                 activations[pi][invocation.order][batch.index] = self.run_invocation(
                     batch, partition, skip_trackers, invocation
                 )
-                print(f"<<< forward {pi}, {invocation.order}, {batch.index}", file=cactus)
                 del activations[invocation.source.index][invocation.order - 1][batch.index]
 
             elif invocation.source and invocation.source.stage != self.group.rank():
@@ -324,22 +298,19 @@ class AsyncEventLoop:
         invocations, activations = self.get_invocations_and_activations()
 
         expected_invocations = len(invocations) * len(batches)
-        actual_invocations = 0
 
         count_per_order = dict()
 
-        if actual_invocations < expected_invocations:
-            self.event_loop_inner(
-                expected_invocations,
-                skip_trackers,
-                activations,
-                invocations,
-                count_per_order,
-                already_received=actual_invocations,
-                event=event,
-                ignore_gradients=True,
-                batches=batches,
-            )
+        self.event_loop_inner(
+            expected_invocations,
+            skip_trackers,
+            activations,
+            invocations,
+            count_per_order,
+            event=event,
+            ignore_gradients=True,
+            batches=batches,
+        )
 
         if self.training:
             return {
@@ -364,7 +335,7 @@ class AsyncEventLoop:
             activations,
             invocations,
             head_ctx["count_per_order"],
-            already_received=expected_invocations,
+            ignore_activations=True,
         )
 
     def get_batch_from_message(self, message: PipeMessage) -> Batch:
@@ -390,48 +361,20 @@ class AsyncEventLoop:
 
         invocations, activations = self.get_invocations_and_activations()
         expected_invocations = len(invocations) * len(batches)
-        actual_invocations = 0
 
         rank = self.group.rank()
         count_per_order = dict()
 
-        for batchi, batch in enumerate(batches):
-            if rank == 0:
-                order = 0
-            else:
-                message = self.transport.recv_message_header(EVENT_LOOP_QUEUE)
-                args: AsyncMessageBody = message.args
-
-                batch = self.get_batch_from_message(message)
-                order = args.order
-
-            print(f"tail-eli {batchi}, {len(batches)}, {torch.distributed.get_rank()}", file=cactus)
-
-            inv_count, last_order = self.run_invocations_on_batch(batch, invocations, order, skip_trackers, activations)
-            actual_invocations += inv_count
-            count_per_order[last_order] = inv_count
-
-            try:
-                if invocations[last_order].dest is None:
-                    self.prepare_tail_backward(
-                        batch, activations, invocations, count_per_order, len(invocations) - inv_count
-                    )
-            except Exception as e:
-                print(f"fucaljkrlka {e}")
-
-        if actual_invocations < expected_invocations:
-            expected_gradients = 0  # (len(invocations) - 1) * len(batches)
-
-            self.event_loop_inner(
-                expected_invocations,
-                skip_trackers,
-                activations,
-                invocations,
-                count_per_order,
-                already_received=actual_invocations,
-                ignore_gradients=True,
-                tail=True,
-            )
+        self.event_loop_inner(
+            expected_invocations,
+            skip_trackers,
+            activations,
+            invocations,
+            count_per_order,
+            ignore_gradients=True,
+            tail=True,
+            batches=batches if rank == 0 else None,
+        )
 
         for index, batch in activations[len(self.partitions) - 1][next(reversed(invocations.values())).order].items():
             batches[index] = batch
@@ -469,7 +412,7 @@ class AsyncEventLoop:
         count_per_order: Dict[int, int],
         *,
         batches: Optional[List[Batch]] = None,
-        already_received: int = 0,
+        ignore_activations: bool = False,
         ignore_gradients: bool = False,
         event: Optional[Event] = None,
         tail: bool = False,
@@ -478,11 +421,15 @@ class AsyncEventLoop:
         activations for the forward pass, and if `self.training` is true,
         processes gradients for the backward pass."""
 
-        num_activations = already_received
         if self.training and not ignore_gradients:
             num_gradients = 0
         else:
             num_gradients = expected_invocations
+
+        if ignore_activations:
+            num_activations = expected_invocations
+        else:
+            num_activations = 0
 
         stashed_messages = {}
         batch_iter = iter(batches) if batches else None
@@ -490,12 +437,11 @@ class AsyncEventLoop:
 
         message_tensor = torch.empty(MESSAGE_TENSOR_SIZE, dtype=torch.uint8, device=self.transport.input_device)
         gr = get_model_parallel_group()
-        should_use_irecv = (
+        should_use_irecv = False and (
             any(inv.source and inv.source.stage != self.group.rank() for inv in invocations.values()) and gr.rank() == 0
         )
 
         if should_use_irecv:  # and num_activations < expected_invocations:
-            print(f"yay work_itemm")
             work_item = torch.distributed.irecv(message_tensor, src=None, tag=EVENT_LOOP_QUEUE, group=self.group)
         else:
             work_item = None
@@ -512,10 +458,6 @@ class AsyncEventLoop:
         argop, _ = get_model_parallel_prev_next_ranks()
 
         while num_activations < expected_invocations or num_gradients < expected_invocations:
-            print(
-                f"eli {num_activations}, {num_gradients}, {expected_invocations}, {processed_batch_count},"
-                f" {torch.distributed.get_rank()}"
-            )
             if num_activations == expected_invocations and num_gradients == 0 and event is not None:
                 # We are ready to do the backward pass, but must wait for
                 # PipeRPCWrapper to signal that it is safe to proceed, otherwise
@@ -530,7 +472,6 @@ class AsyncEventLoop:
 
             if gr.rank() == 0:
                 if work_item and (work_item.is_completed() or processed_batch_count == num_batches):
-                    print(f"work item!")
                     work_item.wait()
                     message = self.transport.recv_message_header(EVENT_LOOP_QUEUE, future=message_tensor)
                     args: AsyncMessageBody = message.args
@@ -551,29 +492,9 @@ class AsyncEventLoop:
                     inv_order = args.order
                     microbatch_index = args.microbatch_index
 
-                sequence = torch.tensor([inv_order, microbatch_index], device=self.transport.input_device)
-                with torch.cuda.stream(self.broadcast_stream):
-                    print(f">>> broadcast", file=cactus)
-                    # torch.distributed.broadcast(sequence, src=_get_global_rank(gr, 0), group=gr)
-                    for rank in range(1, gr.size()):
-                        torch.distributed.send(sequence, _get_global_rank(gr, rank), tag=1, group=argop)
-                    torch.cuda.current_stream().synchronize()
-                    print(f"<<< broadcast", file=cactus)
-                #torch.distributed.barrier(group=gr)
+                self.transport.send_sequence((inv_order, microbatch_index), argop)
             else:
-                assert torch.cuda.current_device() == int(os.environ["OMPI_COMM_WORLD_RANK"])
-                sequence = torch.tensor([0, 0], device=self.transport.input_device)
-                if len(stashed_messages) == 0 and not batch_iter:  # FIXME(tom) predict if next is batch?
-                    message = None  # self.transport.recv_message_header(EVENT_LOOP_QUEUE)
-
-                with torch.cuda.stream(self.broadcast_stream):
-                    print(f">>> broadcast", file=cactus)
-                    # torch.distributed.broadcast(sequence, src=_get_global_rank(gr, 0), group=gr)
-                    torch.distributed.recv(sequence, _get_global_rank(gr, 0), tag=1, group=argop)
-                    torch.cuda.current_stream().synchronize()
-                    print(f"<<< broadcast", file=cactus)
-                    expected_sequence = tuple(sequence.tolist())
-                #torch.distributed.barrier(group=gr)
+                expected_sequence = self.transport.recv_sequence(argop)
 
                 while True:
                     if message is None:
@@ -604,13 +525,9 @@ class AsyncEventLoop:
                         message_type = args.message_type
                         break
 
-            # torch.distributed.barrier(group=gr)
-            try:
-                assert sequence[0] == inv_order
-                assert sequence[1] == microbatch_index
-            except Exception as e:
-                print(f"asssert {sequence}, {[inv_order, args.microbatch_index]}")
-                raise e
+                # torch.distributed.barrier(group=gr)
+                assert expected_sequence[0] == inv_order
+                assert expected_sequence[1] == microbatch_index
 
             invocation = invocations[inv_order]
 
@@ -623,10 +540,6 @@ class AsyncEventLoop:
                 if batch is None:
                     batch = self.get_batch_from_message(message)
 
-                if work_item and work_item.is_completed():
-                    work_item.wait()
-                    work_item_done = True
-
                 inv_count, last_order = self.run_invocations_on_batch(
                     batch, invocations, inv_order, skip_trackers, activations
                 )
@@ -635,15 +548,12 @@ class AsyncEventLoop:
 
                 count_per_order[last_order] = inv_count
                 num_activations += inv_count
-                try:
-                    if tail and invocations[last_order].dest is None:
-                        self.prepare_tail_backward(
-                            batch, activations, invocations, count_per_order, len(invocations) - inv_count
-                        )
+                if tail and invocations[last_order].dest is None:
+                    self.prepare_tail_backward(
+                        batch, activations, invocations, count_per_order, len(invocations) - inv_count
+                    )
 
-                    assert num_activations <= expected_invocations
-                except Exception as e:
-                    print(f"fucaljkrlka {e}")
+                assert num_activations <= expected_invocations
 
                 if (
                     work_item is None
@@ -659,10 +569,6 @@ class AsyncEventLoop:
                 num_gradients += count_per_order[invocation.order]
 
                 recvd_grads = self.transport.recv_message_tensors(message)
-
-                if work_item and work_item.is_completed():
-                    work_item.wait()
-                    work_item_done = True
 
                 self.perform_backward_for_invocation(self.transport, message, recvd_grads, activations, invocation)
                 if work_item is None and should_use_irecv and num_gradients < expected_invocations:
