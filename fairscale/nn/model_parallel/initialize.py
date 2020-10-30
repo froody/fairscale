@@ -108,12 +108,10 @@ def initialize_model_parallel(
         for j in range(pipeline_length):
             ranks = groups[i, j, :].tolist()
             group = torch.distributed.new_group(ranks, backend=model_parallel_backend)
+            group2 = torch.distributed.new_group(ranks, backend=pipeline_backend)
             if i == found[0] and j == found[1]:
                 _MODEL_PARALLEL_GROUP = group
-            elif i == found[0] and j + 1 == found[1]:
-                _MODEL_PARALLEL_RANKS_PREV = ranks
-            elif i == found[0] and j == found[1] + 1:
-                _MODEL_PARALLEL_RANKS_NEXT = ranks
+                _MODEL_PARALLEL_RANKS_PREV = group2
 
     global _PIPELINE_PARALLEL_GROUP
     assert _PIPELINE_PARALLEL_GROUP is None, "model parallel group is already initialized"

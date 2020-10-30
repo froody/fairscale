@@ -168,8 +168,10 @@ class AsyncRecvOperator(torch.autograd.Function):
 
                     invocation = tail_ctx.invocations[args.order]
                     expected_gradients -= tail_ctx.count_per_order[invocation.order]
+                    recvd_grads = ctx.transport.recv_message_tensors(message)
+
                     AsyncEventLoop.perform_backward_for_invocation(
-                        ctx.transport, message, tail_ctx.activations, invocation
+                        ctx.transport, message, recvd_grads, tail_ctx.activations, invocation
                     )
         except Exception as e:
             print(f"fucaljkrlka {e}")
@@ -252,12 +254,12 @@ class AsyncEventLoop:
 
     @staticmethod
     def perform_backward_for_invocation(
-        transport, message: PipeMessage, activations: Activations, invocation: Invocation
+        transport, message: PipeMessage, recvd_grads, activations: Activations, invocation: Invocation
     ) -> None:
         """Perform the backward pass by looking up the appropriate `Batch` and
         then calling `backward` on the tensor"""
 
-        recvd_grads = transport.recv_message_tensors(message)
+        # recvd_grads = transport.recv_message_tensors(message)
         print(f"{invocation.this.index}, {invocation.order}, {message.args.microbatch_index}", file=cactus)
 
         batch: Batch = activations[invocation.this.index][invocation.order][message.args.microbatch_index]
@@ -484,21 +486,27 @@ class AsyncEventLoop:
         num_batches = expected_invocations / len(invocations)
 
         message_tensor = torch.empty(MESSAGE_TENSOR_SIZE, dtype=torch.uint8, device=self.transport.input_device)
-        will_receive_activations = (
-            any(inv.source and inv.source.stage != self.group.rank() for inv in invocations.values())
-            and batches is not None
-        )
         gr = get_model_parallel_group()
+        should_use_irecv = (
+            any(inv.source and inv.source.stage != self.group.rank() for inv in invocations.values()) and gr.rank() == 0
+        )
 
-        if will_receive_activations and gr.rank() == 0 and num_activations < expected_invocations:
+        if should_use_irecv:  # and num_activations < expected_invocations:
             print(f"yay work_itemm")
             work_item = torch.distributed.irecv(message_tensor, src=None, tag=EVENT_LOOP_QUEUE, group=self.group)
         else:
             work_item = None
 
-        processed_batch_count = 0
+        work_item_done = False
+
+        if batch_iter:
+            processed_batch_count = 0
+        else:
+            processed_batch_count = num_batches
 
         inv_per_batch = 0
+
+        argop, _ = get_model_parallel_prev_next_ranks()
 
         while num_activations < expected_invocations or num_gradients < expected_invocations:
             print(f"eli {num_activations}, {num_gradients}, {expected_invocations}, {torch.distributed.get_rank()}")
@@ -515,9 +523,10 @@ class AsyncEventLoop:
             message_type = None
 
             if gr.rank() == 0:
-                if batch_iter and work_item and work_item.is_completed():
-
-                    work_item.wait()
+                if work_item and work_item.is_completed():
+                    print(f"work item!")
+                    if not work_item_done:
+                        work_item.wait()
                     message = self.transport.recv_message_header(EVENT_LOOP_QUEUE, future=message_tensor)
                     args: AsyncMessageBody = message.args
                     message_type = args.message_type
@@ -540,21 +549,25 @@ class AsyncEventLoop:
                 sequence = torch.tensor([inv_order, microbatch_index]).cuda()
                 with torch.cuda.stream(self.broadcast_stream):
                     print(f">>> broadcast", file=cactus)
-                    torch.distributed.broadcast(sequence, src=_get_global_rank(gr, 0), group=gr)
-                    self.broadcast_stream.synchronize()
+                    # torch.distributed.broadcast(sequence, src=_get_global_rank(gr, 0), group=gr)
+                    for rank in range(1, gr.size()):
+                        torch.distributed.send(sequence, _get_global_rank(gr, rank), tag=1, group=argop)
+                    torch.cuda.current_stream().synchronize()
                     print(f"<<< broadcast", file=cactus)
+                torch.distributed.barrier(group=gr)
             else:
                 sequence = torch.tensor([0, 0]).cuda()
-                if len(stashed_messages) == 0:
-                    message = None  # self.transport.recv_message_header(EVENT_LOOP_QUEUE, future=future)
-                    future = None
+                if len(stashed_messages) == 0 and not batch_iter:  # FIXME(tom) predict if next is batch?
+                    message = self.transport.recv_message_header(EVENT_LOOP_QUEUE)
 
                 with torch.cuda.stream(self.broadcast_stream):
                     print(f">>> broadcast", file=cactus)
-                    torch.distributed.broadcast(sequence, src=_get_global_rank(gr, 0), group=gr)
-                    self.broadcast_stream.synchronize()
+                    # torch.distributed.broadcast(sequence, src=_get_global_rank(gr, 0), group=gr)
+                    torch.distributed.recv(sequence, _get_global_rank(gr, 0), tag=1, group=argop)
+                    torch.cuda.current_stream().synchronize()
                     print(f"<<< broadcast", file=cactus)
                     expected_sequence = tuple(sequence.tolist())
+                torch.distributed.barrier(group=gr)
 
                 while True:
                     if message is None:
@@ -604,6 +617,10 @@ class AsyncEventLoop:
                 if batch is None:
                     batch = self.get_batch_from_message(message)
 
+                if work_item and work_item.is_completed():
+                    work_item.wait()
+                    work_item_done = True
+
                 inv_count, last_order = self.run_invocations_on_batch(
                     batch, invocations, inv_order, skip_trackers, activations
                 )
@@ -624,17 +641,29 @@ class AsyncEventLoop:
 
                 if (
                     work_item is None
-                    and will_receive_activations
-                    and gr.rank() == 0
+                    and should_use_irecv
                     and expected_invocations - num_activations > (num_batches - processed_batch_count) * inv_per_batch
                 ):
                     work_item = torch.distributed.irecv(
                         message_tensor, src=None, tag=EVENT_LOOP_QUEUE, group=self.group
                     )
+                    work_item_done = False
 
             elif message_type is AsyncMessageType.Gradients:
                 num_gradients += count_per_order[invocation.order]
-                self.perform_backward_for_invocation(self.transport, message, activations, invocation)
+
+                recvd_grads = self.transport.recv_message_tensors(message)
+
+                if work_item and work_item.is_completed():
+                    work_item.wait()
+                    work_item_done = True
+
+                self.perform_backward_for_invocation(self.transport, message, recvd_grads, activations, invocation)
+                if work_item is None and should_use_irecv and num_gradients < expected_invocations:
+                    work_item = torch.distributed.irecv(
+                        message_tensor, src=None, tag=EVENT_LOOP_QUEUE, group=self.group
+                    )
+                    work_item_done = False
 
     @staticmethod
     def prepare_tail_backward(
