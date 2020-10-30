@@ -394,7 +394,7 @@ class AsyncEventLoop:
         rank = self.group.rank()
         count_per_order = dict()
 
-        for batch in batches:
+        for batchi, batch in enumerate(batches):
             if rank == 0:
                 order = 0
             else:
@@ -403,6 +403,8 @@ class AsyncEventLoop:
 
                 batch = self.get_batch_from_message(message)
                 order = args.order
+
+            print(f"tail-eli {batchi}, {len(batches)}, {torch.distributed.get_rank()}", file=cactus)
 
             inv_count, last_order = self.run_invocations_on_batch(batch, invocations, order, skip_trackers, activations)
             actual_invocations += inv_count
@@ -509,7 +511,7 @@ class AsyncEventLoop:
         argop, _ = get_model_parallel_prev_next_ranks()
 
         while num_activations < expected_invocations or num_gradients < expected_invocations:
-            print(f"eli {num_activations}, {num_gradients}, {expected_invocations}, {torch.distributed.get_rank()}")
+            print(f"eli {num_activations}, {num_gradients}, {expected_invocations}, {processed_batch_count}, {torch.distributed.get_rank()}")
             if num_activations == expected_invocations and num_gradients == 0 and event is not None:
                 # We are ready to do the backward pass, but must wait for
                 # PipeRPCWrapper to signal that it is safe to proceed, otherwise
@@ -523,10 +525,9 @@ class AsyncEventLoop:
             message_type = None
 
             if gr.rank() == 0:
-                if work_item and work_item.is_completed():
+                if work_item and (work_item.is_completed() or processed_batch_count == num_batches):
                     print(f"work item!")
-                    if not work_item_done:
-                        work_item.wait()
+                    work_item.wait()
                     message = self.transport.recv_message_header(EVENT_LOOP_QUEUE, future=message_tensor)
                     args: AsyncMessageBody = message.args
                     message_type = args.message_type
@@ -558,7 +559,7 @@ class AsyncEventLoop:
             else:
                 sequence = torch.tensor([0, 0]).cuda()
                 if len(stashed_messages) == 0 and not batch_iter:  # FIXME(tom) predict if next is batch?
-                    message = self.transport.recv_message_header(EVENT_LOOP_QUEUE)
+                    message = None #self.transport.recv_message_header(EVENT_LOOP_QUEUE)
 
                 with torch.cuda.stream(self.broadcast_stream):
                     print(f">>> broadcast", file=cactus)
