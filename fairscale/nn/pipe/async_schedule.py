@@ -196,7 +196,8 @@ class AsyncEventLoop:
         self.transport = transport
         self.group = group
         self.partitions: List[ModuleWrapper] = partitions
-        self.broadcast_stream = torch.cuda.Stream()
+        # self.broadcast_stream = torch.cuda.Stream()
+        self.broadcast_stream = torch.cuda.current_stream()
 
     def send_async_message(self, dst_rank: int, result: Batch, invocation: Invocation) -> Batch:
         """Send batch to dst_rank, and use AutogradWithoutActivations to delete
@@ -511,7 +512,10 @@ class AsyncEventLoop:
         argop, _ = get_model_parallel_prev_next_ranks()
 
         while num_activations < expected_invocations or num_gradients < expected_invocations:
-            print(f"eli {num_activations}, {num_gradients}, {expected_invocations}, {processed_batch_count}, {torch.distributed.get_rank()}")
+            print(
+                f"eli {num_activations}, {num_gradients}, {expected_invocations}, {processed_batch_count},"
+                f" {torch.distributed.get_rank()}"
+            )
             if num_activations == expected_invocations and num_gradients == 0 and event is not None:
                 # We are ready to do the backward pass, but must wait for
                 # PipeRPCWrapper to signal that it is safe to proceed, otherwise
@@ -547,7 +551,7 @@ class AsyncEventLoop:
                     inv_order = args.order
                     microbatch_index = args.microbatch_index
 
-                sequence = torch.tensor([inv_order, microbatch_index]).cuda()
+                sequence = torch.tensor([inv_order, microbatch_index], device=self.transport.input_device)
                 with torch.cuda.stream(self.broadcast_stream):
                     print(f">>> broadcast", file=cactus)
                     # torch.distributed.broadcast(sequence, src=_get_global_rank(gr, 0), group=gr)
@@ -555,11 +559,12 @@ class AsyncEventLoop:
                         torch.distributed.send(sequence, _get_global_rank(gr, rank), tag=1, group=argop)
                     torch.cuda.current_stream().synchronize()
                     print(f"<<< broadcast", file=cactus)
-                torch.distributed.barrier(group=gr)
+                #torch.distributed.barrier(group=gr)
             else:
-                sequence = torch.tensor([0, 0]).cuda()
+                assert torch.cuda.current_device() == int(os.environ["OMPI_COMM_WORLD_RANK"])
+                sequence = torch.tensor([0, 0], device=self.transport.input_device)
                 if len(stashed_messages) == 0 and not batch_iter:  # FIXME(tom) predict if next is batch?
-                    message = None #self.transport.recv_message_header(EVENT_LOOP_QUEUE)
+                    message = None  # self.transport.recv_message_header(EVENT_LOOP_QUEUE)
 
                 with torch.cuda.stream(self.broadcast_stream):
                     print(f">>> broadcast", file=cactus)
@@ -568,7 +573,7 @@ class AsyncEventLoop:
                     torch.cuda.current_stream().synchronize()
                     print(f"<<< broadcast", file=cactus)
                     expected_sequence = tuple(sequence.tolist())
-                torch.distributed.barrier(group=gr)
+                #torch.distributed.barrier(group=gr)
 
                 while True:
                     if message is None:

@@ -273,14 +273,15 @@ class PipeRPCWrapper(nn.Module):
         training: bool, shape: torch.Size, dtype: torch.dtype
     ) -> Optional[Tuple[SizeOrSizes, DtypeOrDtypes]]:
         try:
+            model = PipeModel
+            assert model.group
+            set_device_based_on_group(model.group)
+
             if isinstance(shape, torch.Size):
                 tensor = torch.empty(shape, dtype=dtype)
             else:
                 tensor = tuple([torch.empty(s, dtype=d) for s, d in zip(shape, dtype)])
 
-            model = PipeModel
-            assert model.group
-            set_device_based_on_group(model.group)
 
             model.train(training)
             result = model(tensor)
