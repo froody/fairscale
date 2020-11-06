@@ -748,12 +748,12 @@ class Pipe(Module):
 
             return output
 
-    def back_helper(self, output: List[microbatch.Batch]) -> None:
+    def back_helper(self, output: Optional[List[microbatch.Batch]] = None) -> None:
         if self.final_stage:
             raise ValueError("back_helper should only be called on non-final stages")
 
         if self.pipeline:
-            self.pipeline.back_helper(list(reversed(output)))
+            self.pipeline.back_helper(list(reversed(output or [])))
 
 
 class PipelinedBackwardPass(torch.autograd.Function):

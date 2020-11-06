@@ -3,7 +3,6 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-from threading import Event, Lock, Thread
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
 
 import torch
@@ -50,12 +49,12 @@ def get_global_ranks_from_group(group: ProcessGroup) -> List[int]:
 class PipeBackRedirect(torch.autograd.Function):
     @staticmethod
     # type: ignore
-    def forward(ctx, inputs, dest, event, message, transport, futures):
+    def forward(ctx, inputs, dest, message, transport, futures, model):
         ctx.dest = dest
-        ctx.event = event
         ctx.message = message
         ctx.transport = transport
         ctx.futures = futures
+        ctx.model = model
         return inputs
 
     @staticmethod
@@ -63,8 +62,9 @@ class PipeBackRedirect(torch.autograd.Function):
     def backward(ctx, *grad):
         ctx.message.tensors = tuple(grad)
         ctx.transport.send_message(ctx.message, sync=False, skip_header=True)
-        ctx.event.set()
-        # torch.futures.wait_all(ctx.futures)
+        ctx.model.back_helper([])
+
+        torch.futures.wait_all(ctx.futures)
         return (None, None, None, None, None, None)
 
 
@@ -76,7 +76,8 @@ def callback_with_model(callback: Callable[[Any, Pipe], None], ctx: Any) -> None
         with PipeModel.lock:
             callback(ctx, PipeModel)
     except Exception as e:
-        print(f"callback_with_model got {e}")
+        print(f"Exception raised in rpc callback: {e}")
+        raise e
 
 
 class PipeRPCWrapper(nn.Module):
@@ -92,7 +93,6 @@ class PipeRPCWrapper(nn.Module):
         super().__init__()
         self.group = cast(ProcessGroup, kwargs.get("group")) or get_pipeline_parallel_group()
         assert self.group.rank() == 0
-        self.lock = Lock()
 
         if True:
             assert (
@@ -107,15 +107,14 @@ class PipeRPCWrapper(nn.Module):
 
         self.model = Pipe(*args, **kwargs)
         self.worker_map = kwargs["worker_map"]
-        self._foreach_worker(self._register_remote_model, args=(args, kwargs))
+        torch.futures.wait_all(self._foreach_worker(self._register_remote_model, args=(args, kwargs)))
         self.model.cuda()
 
     def _get_rpc_name(self, rank: int) -> str:
         return self.worker_map[_get_global_rank(self.group, rank)]
 
-    def _foreach_worker(self, callback: Callable, args: Any = None) -> None:
-        futures = [rpc.rpc_async(self._get_rpc_name(rank), callback, args=args) for rank in range(1, self.group.size())]
-        futures = [f.wait() for f in futures]
+    def _foreach_worker(self, callback: Callable, args: Any = None) -> List[torch.futures.Future]:
+        return [rpc.rpc_async(self._get_rpc_name(rank), callback, args=args) for rank in range(1, self.group.size())]
 
     def foreach_worker(
         self, callback: Callable[[Any, Pipe], None], ctx: Any = None, *, include_self: bool = False
@@ -134,7 +133,7 @@ class PipeRPCWrapper(nn.Module):
         )
         """
 
-        self._foreach_worker(callback_with_model, args=(callback, ctx))
+        torch.futures.wait_all(self._foreach_worker(callback_with_model, args=(callback, ctx)))
 
         if include_self:
             with self.model.lock:
@@ -149,17 +148,12 @@ class PipeRPCWrapper(nn.Module):
         else:
             num_tensors = len(tensor)
 
-        futures = [
-            rpc.rpc_async(self._get_rpc_name(rank), self._model_forward, args=(self.model.training, shape, dtype))
-            for rank in range(1, self.group.size())
-        ]
+        futures = self._foreach_worker(self._model_forward, args=(self.model.training, shape, dtype))
 
         if self.model.final_stage:
             return self.model(tensor)
         else:
-            event = Event()
-            t = Thread(target=self._model_forward_first_stage, args=(tensor, event))
-            t.start()
+            self.model(tensor)
 
             shape, dtype = futures.pop().wait()
             dest_rank = self.group.size() - 1
@@ -176,7 +170,7 @@ class PipeRPCWrapper(nn.Module):
             )
             futures.append(back_fut)
 
-            result = self._recv_result(self.model, shape, dtype, activations)
+            result = self._recv_result(shape, dtype, activations)
             if isinstance(result, torch.Tensor):
                 result.requires_grad_()
             else:
@@ -185,20 +179,19 @@ class PipeRPCWrapper(nn.Module):
 
             assert self.model.pipeline
             return PipeBackRedirect.apply(
-                result, dest_global_rank, event, grads, self.model.pipeline.transport, futures
+                result, dest_global_rank, grads, self.model.pipeline.transport, futures, self.model
             )
 
     @property
     def final_stage(self) -> bool:
         return self.model.final_stage
 
-    @staticmethod
-    def _recv_result(model: Pipe, shapes: SizeOrSizes, dtypes: DtypeOrDtypes, message: PipeMessage) -> TensorOrTensors:
+    def _recv_result(self, shapes: SizeOrSizes, dtypes: DtypeOrDtypes, message: PipeMessage) -> TensorOrTensors:
         group = get_pipeline_parallel_group()
         set_device_based_on_group(group)
 
-        assert model.pipeline
-        transport = model.pipeline.transport
+        assert self.model.pipeline
+        transport = self.model.pipeline.transport
 
         if isinstance(shapes, torch.Size):
             message.tensor_shapes = [cast(torch.Size, shapes)]
@@ -213,26 +206,30 @@ class PipeRPCWrapper(nn.Module):
 
     @staticmethod
     def _send_result_and_do_backwards(training: bool, message: PipeMessage, grads_message: PipeMessage) -> None:
-        group = get_pipeline_parallel_group()
-        set_device_based_on_group(group)
-        result = PipeResult
-        model = PipeModel
+        try:
+            group = get_pipeline_parallel_group()
+            set_device_based_on_group(group)
+            result = PipeResult
+            model = PipeModel
 
-        if isinstance(result, torch.Tensor):
-            result = tuple([result])
+            if isinstance(result, torch.Tensor):
+                result = tuple([result])
 
-        message.tensors = tuple(result)
-        assert model.pipeline
-        transport = model.pipeline.transport
-        transport.send_message(message, sync=False, skip_header=True)
+            message.tensors = tuple(result)
+            assert model.pipeline
+            transport = model.pipeline.transport
+            transport.send_message(message, sync=False, skip_header=True)
 
-        if training:
-            grads_message.tensor_shapes = [r.shape for r in result]
-            grads_message.tensor_dtypes = [r.dtype for r in result]
-            grads_message = transport.recv_message_tensors(grads_message)
+            if training:
+                grads_message.tensor_shapes = [r.shape for r in result]
+                grads_message.tensor_dtypes = [r.dtype for r in result]
+                grads_message = transport.recv_message_tensors(grads_message)
 
-            with model.lock:
-                torch.autograd.backward(result, grads_message.tensors, retain_graph=True)
+                with model.lock:
+                    torch.autograd.backward(result, grads_message.tensors, retain_graph=True)
+        except Exception as e:
+            print(f"Exception raised in rpc callback: {e}")
+            raise e
 
     @staticmethod
     def _register_remote_model(args: List[Any], kwargs: Dict[str, Any]) -> None:
@@ -250,14 +247,14 @@ class PipeRPCWrapper(nn.Module):
         training: bool, shape: torch.Size, dtype: torch.dtype
     ) -> Optional[Tuple[SizeOrSizes, DtypeOrDtypes]]:
         try:
+            model = PipeModel
+            assert model.group
+            set_device_based_on_group(model.group)
+
             if isinstance(shape, torch.Size):
                 tensor = torch.empty(shape, dtype=dtype)
             else:
                 tensor = tuple([torch.empty(s, dtype=d) for s, d in zip(shape, dtype)])
-
-            model = PipeModel
-            assert model.group
-            set_device_based_on_group(model.group)
 
             model.train(training)
             result = model(tensor)
@@ -268,14 +265,5 @@ class PipeRPCWrapper(nn.Module):
 
             return None
         except Exception as e:
-            print(f"_model_forward got {e}")
-            raise e
-
-    def _model_forward_first_stage(self, tensor: TensorOrTensors, event: Event) -> None:
-        try:
-            assert self.model.group
-            set_device_based_on_group(self.model.group)
-            self.model(tensor, event=event)
-        except Exception as e:
-            print(f"_model_forward got {e}")
+            print(f"Exception raised in rpc callback: {e}")
             raise e

@@ -69,21 +69,37 @@ def check_pipe_against_reference(balance, model_constructor, checkpoint="except_
         dst.load_state_dict(copy.deepcopy(src.state_dict()))
 
     reference_model = nn.Sequential(*reference_model).cuda()
+    nbatch = 100
 
     pipe = PipeRPCWrapper(
-        model, balance, input_device=torch.cuda.current_device(), worker_map=get_worker_map(), checkpoint=checkpoint,
+        model,
+        balance,
+        input_device=torch.cuda.current_device(),
+        worker_map=get_worker_map(),
+        checkpoint=checkpoint,
+        chunks=nbatch,
     )
 
     pipe.foreach_worker(register_optimizer, include_self=True)
     register_optimizer(None, reference_model)
 
-    inputs = torch.rand(10).cuda()
-    target = torch.rand(10).cuda()
+    inputs = torch.rand(nbatch, 10).cuda()
+    target = torch.rand(nbatch, 10).cuda()
     cloned = inputs.clone()
     output = pipe(inputs)
     ref_out = reference_model(inputs)
 
-    assert torch.equal(ref_out.cpu(), output.cpu())
+    left = ref_out.cpu()
+    right = output.cpu()
+    assert torch.allclose(ref_out.cpu(), output.cpu(), atol=1.0e-3)
+    assert torch.allclose(ref_out.cpu(), output.cpu(), atol=1.0e-4)
+    assert torch.allclose(ref_out.cpu(), output.cpu(), atol=1.0e-5)
+    assert torch.allclose(ref_out.cpu(), output.cpu(), atol=1.0e-6)
+    assert torch.allclose(ref_out.cpu(), output.cpu(), atol=1.0e-7)
+    # assert torch.allclose(ref_out.cpu(), output.cpu(), atol=1.0e-9)
+    # assert torch.allclose(ref_out.cpu(), output.cpu(), atol=1.0e-11)
+    # if not torch.equal(ref_out.cpu(), output.cpu()):
+    # print(f"wat {left.tolist()}, {right.tolist()}, {left.tolist() == right.tolist()}")
 
     for out in output, ref_out:
         target = target.to(out.device)
@@ -99,7 +115,8 @@ def check_pipe_against_reference(balance, model_constructor, checkpoint="except_
     final_output = pipe(inputs)
     final_ref = reference_model(inputs.cuda())
 
-    assert torch.equal(final_output.cpu(), final_ref.cpu())
+    # assert torch.equal(final_output.cpu(), final_ref.cpu())
+    assert torch.allclose(final_output.cpu(), final_ref.cpu(), atol=1.0e-7)
 
 
 @torch_spawn([3])

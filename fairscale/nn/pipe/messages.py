@@ -6,10 +6,11 @@
 from abc import ABC
 from queue import Empty as QueueEmpty
 from queue import Queue
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, cast
 
 from dataclasses import dataclass
 import torch
+from torch.distributed.distributed_c10d import _get_global_rank
 
 from fairscale.nn.model_parallel import get_pipeline_parallel_group
 from fairscale.utils.object import pyobject_to_tensor, tensor_to_pyobject
@@ -41,7 +42,9 @@ class Transport(ABC):
         message = self.recv_message_header(queue_name, nowait)
         return self.recv_message_tensors(message)
 
-    def recv_message_header(self, queue_name: int, nowait: bool = False) -> PipeMessage:
+    def recv_message_header(
+        self, queue_name: int, nowait: bool = False, tensor: Optional[torch.Tensor] = None
+    ) -> PipeMessage:
         ...
 
     def recv_message_tensors(self, message: PipeMessage) -> PipeMessage:
@@ -51,6 +54,15 @@ class Transport(ABC):
         ...
 
     def get_out_of_order(self, queue_name: int, index: int) -> Tensors:
+        ...
+
+    def send_sequence(self, sequence: Tuple[int, int], group: torch.distributed.ProcessGroup) -> None:
+        ...
+
+    def recv_sequence(self, group: torch.distributed.ProcessGroup) -> Tuple[int, int]:
+        ...
+
+    def get_irecv_wrapper(self, group: torch.distributed.ProcessGroup, tag: int) -> Optional["IRecvWrapper"]:
         ...
 
 
@@ -63,6 +75,30 @@ def MakeTransport(use_rpc: bool, worker_map: Optional[Dict[int, str]], input_dev
         return SendRecvTransport(worker_map, input_device)
 
 
+class IRecvWrapper:
+    def __init__(self, input_device: InputDevice, group: torch.distributed.ProcessGroup, tag: int):
+        self.tensor = torch.empty(MESSAGE_TENSOR_SIZE, dtype=torch.uint8, device=input_device)
+        self.group = group
+        self.tag = tag
+        self.work_item: Optional[torch.distributed.Work] = None
+
+    def maybe_irecv(self) -> None:
+        if self.work_item is None:
+            self.work_item = torch.distributed.irecv(self.tensor, src=None, tag=self.tag, group=self.group)
+
+    def is_completed(self) -> bool:
+        return (self.work_item is not None) and self.work_item.is_completed()
+
+    def is_active(self) -> bool:
+        return self.work_item is not None
+
+    def wait(self) -> torch.Tensor:
+        assert self.work_item
+        self.work_item.wait()
+        self.work_item = None
+        return self.tensor
+
+
 class RpcTransport(Transport):
     def send_message(self, message: PipeMessage, sync: bool = False, skip_header: bool = False) -> None:
         message.tensors = tuple(t.cpu() for t in message.tensors)
@@ -73,7 +109,10 @@ class RpcTransport(Transport):
         else:
             torch.distributed.rpc.rpc_async(name, rpc_push_queue, args=(message,))
 
-    def recv_message_header(self, queue_name: int, nowait: bool = False) -> PipeMessage:
+    def recv_message_header(
+        self, queue_name: int, nowait: bool = False, tensor: Optional[torch.Tensor] = None
+    ) -> PipeMessage:
+        assert tensor is None
         queue = MessageQueues[queue_name]
         if nowait:
             result = queue.get_nowait()
@@ -104,6 +143,15 @@ class RpcTransport(Transport):
             else:
                 out_of_order.append(message)
 
+    def send_sequence(self, sequence: Tuple[int, int], group: torch.distributed.ProcessGroup) -> None:
+        pass
+
+    def recv_sequence(self, group: torch.distributed.ProcessGroup) -> Tuple[int, int]:
+        return (0, 0)
+
+    def get_irecv_wrapper(self, group: torch.distributed.ProcessGroup, tag: int) -> Optional[IRecvWrapper]:
+        return None
+
 
 class SendRecvTransport(Transport):
     def send_message(self, message: PipeMessage, sync: bool = False, skip_header: bool = False) -> None:
@@ -126,14 +174,21 @@ class SendRecvTransport(Transport):
                 t.contiguous(), message.dest, tag=message.tag + index, group=get_pipeline_parallel_group()
             )
 
-    def recv_message_header(self, queue_name: int, nowait: bool = False) -> PipeMessage:
+    def recv_message_header(
+        self, queue_name: int, nowait: bool = False, tensor: Optional[torch.Tensor] = None
+    ) -> PipeMessage:
         # FIXME(handle nowait)
         if nowait:
             raise QueueEmpty
-        tensor = torch.empty(MESSAGE_TENSOR_SIZE, dtype=torch.uint8, device=self.input_device)
-        torch.cuda.current_stream().synchronize()
-        torch.distributed.recv(tensor, src=None, tag=queue_name, group=get_pipeline_parallel_group())
-        torch.cuda.current_stream().synchronize()
+
+        if tensor is None:
+            tensor = torch.empty(MESSAGE_TENSOR_SIZE, dtype=torch.uint8, device=self.input_device)
+            torch.cuda.current_stream().synchronize()
+            torch.distributed.recv(tensor, src=None, tag=queue_name, group=get_pipeline_parallel_group())
+            torch.cuda.current_stream().synchronize()
+        else:
+            torch.cuda.current_stream().synchronize()
+
         return tensor_to_pyobject(tensor)
 
     def recv_message_tensors(self, message: PipeMessage) -> PipeMessage:
@@ -151,9 +206,23 @@ class SendRecvTransport(Transport):
         return message
 
     def get_out_of_order(self, queue_name: int, index: int) -> Tensors:
-        """Receive a message with a known microbatch index, and handle out-of-order
-        messages by placing them back on the queue"""
-
         message = self.recv_message(queue_name)
         assert message.args == index
         return message.tensors
+
+    def send_sequence(self, sequence: Tuple[int, int], group: torch.distributed.ProcessGroup) -> None:
+        assert group.rank() == 0
+        tensor = torch.tensor(sequence, device=self.input_device)
+        torch.cuda.current_stream().synchronize()
+        for rank in range(1, group.size()):
+            torch.distributed.send(tensor, _get_global_rank(group, rank), tag=1, group=group)
+
+    def recv_sequence(self, group: torch.distributed.ProcessGroup) -> Tuple[int, int]:
+        assert group.rank() != 0
+        tensor = torch.tensor([0, 0], device=self.input_device)
+        torch.distributed.recv(tensor, _get_global_rank(group, 0), tag=1, group=group)
+        torch.cuda.current_stream().synchronize()
+        return cast(Tuple[int, int], tuple(tensor.tolist()))
+
+    def get_irecv_wrapper(self, group: torch.distributed.ProcessGroup, tag: int) -> Optional[IRecvWrapper]:
+        return IRecvWrapper(self.input_device, group, tag)

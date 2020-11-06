@@ -294,18 +294,23 @@ class Pipeline:
             event_loop = AsyncEventLoop(
                 self.mp_partitions, self.group, self.transport, self.training, self.checkpoint_stop,
             )
-            if rank == 0 and not self.final_stage:
-                logging.debug(f"{torch.distributed.get_rank()}: entered event head")
-                event_loop.event_loop_head(batches, skip_trackers, event)
-                logging.debug(f"{torch.distributed.get_rank()}: exited event head")
-            elif self.final_stage:
-                logging.debug(f"{torch.distributed.get_rank()}: entered event tail")
-                event_loop.event_loop_tail(batches, skip_trackers)
-                logging.debug(f"{torch.distributed.get_rank()}: exited event tail")
-            else:
-                logging.debug(f"{torch.distributed.get_rank()}: entered event loop")
-                event_loop.event_loop(len(batches), skip_trackers)
-                logging.debug(f"{torch.distributed.get_rank()}: exited event loop")
+            try:
+                if rank == 0 and not self.final_stage:
+                    logging.debug(f"{torch.distributed.get_rank()}: entered event head")
+                    self.head_ctx = event_loop.event_loop_head(batches, skip_trackers, event)
+                    logging.debug(f"{torch.distributed.get_rank()}: exited event head")
+                elif self.final_stage:
+                    logging.debug(f"{torch.distributed.get_rank()}: entered event tail")
+                    event_loop.event_loop_tail(batches, skip_trackers)
+                    logging.debug(f"{torch.distributed.get_rank()}: exited event tail")
+                else:
+                    logging.debug(f"{torch.distributed.get_rank()}: entered event loop")
+                    event_loop.event_loop(len(batches), skip_trackers)
+                    logging.debug(f"{torch.distributed.get_rank()}: exited event loop")
+            except Exception as e:
+                print(f"event loop bad")
+                print(f"event loop bad {e}")
+                raise e
 
         self.callcount += 1
 
@@ -553,6 +558,12 @@ class Pipeline:
 
     def back_helper(self, output: List[Batch]) -> None:
         if self.style == PipelineStyle.AsyncSchedule:
+            assert self.group
+            event_loop = AsyncEventLoop(
+                self.mp_partitions, self.group, self.transport, self.training, self.checkpoint_stop,
+            )
+            assert self.head_ctx
+            event_loop.head_backwards(self.head_ctx)
             return
 
         o = list(output)
