@@ -23,7 +23,9 @@ from .types import EVENT_LOOP_QUEUE, PipelineStyle, PipeMessage, Tensors
 
 @dataclass(frozen=True)
 class Location:
+    # Pipeline stage or rank where the module is located
     stage: int
+    # Position of the module within a stage
     index: int
 
     def __repr__(self) -> str:
@@ -32,10 +34,23 @@ class Location:
 
 @dataclass(frozen=True)
 class Invocation:
+    # Position in the entire pipeline
     order: int
+    # Location of the module for this Invocation
     this: Location
+    # Location of the source module for this Invocation, may be None if this is
+    # the very first Invocation, i.e. order == 0
     source: Optional[Location]
+    # Location of the destination module for this Invocation, may be None if this is
+    # the very last Invocation, i.e. order == maximum order seen throughout the
+    # pipeline
     dest: Optional[Location]
+
+    def sends_activation(self) -> bool:
+        return bool(self.dest and self.dest.stage != self.this.stage)
+
+    def receives_activation(self) -> bool:
+        return bool(self.source and self.source.stage != self.this.stage)
 
 
 Activations = Dict[int, Dict[int, Dict[int, Batch]]]
@@ -455,6 +470,11 @@ class AsyncEventLoop:
         count_per_order: Dict[int, int],
         expected_gradients: int,
     ) -> None:
+        """Called once per microbatch to handle the case where the final stage
+        receives gradients from an earlier stage due to layer reuse"""
+
+        expected_gradients = sum(inv.sends_activation() for inv in invocations.values())
+
         if expected_gradients > 0:
             grad_fn = next(b.grad_fn for b in batch if b.requires_grad)
             assert grad_fn

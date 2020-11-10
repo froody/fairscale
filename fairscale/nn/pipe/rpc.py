@@ -16,9 +16,6 @@ from fairscale.nn.model_parallel.initialize import get_pipeline_parallel_group
 from . import Pipe
 from .types import EVENT_LOOP_QUEUE, PipeMessage, TensorOrTensors
 
-DEFAULT_MAX_SOURCE_POSITIONS = 1024
-DEFAULT_MAX_TARGET_POSITIONS = 1024
-
 PipeModel: Pipe
 PipeResult: TensorOrTensors
 

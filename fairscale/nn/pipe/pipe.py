@@ -50,8 +50,6 @@ Devices = Union[Iterable[Device], List[Device]]
 Tensors = Tuple[Tensor, ...]
 TensorOrTensors = Union[Tensor, Tensors]
 
-ListOfLazyModules = List[LazyModule]
-
 if TYPE_CHECKING:
     Module = nn.Module[TensorOrTensors]
     NamedModules = OrderedDict[str, Module]
@@ -90,7 +88,7 @@ def verify_list_of_callable(module: Union[nn.Sequential, list]) -> None:
             raise TypeError(f"layer {type(layer)} must be nn.Module or LazyModule to be partitioned")
 
 
-def verify_module(module: Union[nn.Sequential, ListOfLazyModules]) -> None:
+def verify_module(module: Union[nn.Sequential, List[LazyModule]]) -> None:
     if isinstance(module, Iterable) and not isinstance(module, nn.Sequential):
         verify_list_of_callable(module)
     else:
@@ -156,11 +154,15 @@ class PartitionInfo:
 
 
 def instantiate_partition(
-    module: Union[nn.Sequential, ListOfLazyModules],
+    module: Union[nn.Sequential, List[LazyModule]],
     balance: Iterable[int],
     group: torch.distributed.ProcessGroup,
     style: PipelineStyle,
 ) -> List[ModuleWrapper]:
+    """Take a list of modules (either as nn.Module or LazyModule) and generate a
+    list of ModuleWrapper for the current rank. For PipelineStyle.AsyncSchedule,
+    a ModuleWrapper may be have multiple `Invocation` if it is reused more than
+    once"""
     balance = list(balance)
     check_balance(module, balance, True)
 
@@ -359,7 +361,7 @@ class Pipe(Module):
     heuristics to find your own optimal configuration.
 
     Args:
-        module (torch.nn.Sequential):
+        module (torch.nn.Sequential or List[LazyModule]):
             sequential module to be parallelized
         balance (ints):
             list of number of layers in each partition
@@ -446,7 +448,7 @@ class Pipe(Module):
 
     def __init__(
         self,
-        module: Union[nn.Sequential, ListOfLazyModules],
+        module: Union[nn.Sequential, List[LazyModule]],
         balance: Optional[Iterable[int]] = None,
         *,
         style: PipelineStyle = PipelineStyle.SingleProcess,
