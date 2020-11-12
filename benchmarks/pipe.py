@@ -372,7 +372,7 @@ def train(lm_dataloader, model, criterion, optimizer, vocab_size, args):
                 loss /= ddp_group.size()
             loss.backward()
             del target
-        else:
+        elif pipe_group.rank() == 0: # FIXME
             if args.ddp_zero:
                 model.module.back_helper(output)
             else:
@@ -614,6 +614,10 @@ best_device_map = {
 
 
 def bench_mpi(args):
+    import torch_pg
+    torch_pg.init_mpi()
+
+
     guess_rank = int(os.environ["OMPI_COMM_WORLD_RANK"])
     world_size = int(os.environ["OMPI_COMM_WORLD_SIZE"])
     local_rank = int(os.environ["OMPI_COMM_WORLD_LOCAL_RANK"])
