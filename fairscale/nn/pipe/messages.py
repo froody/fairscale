@@ -84,7 +84,12 @@ class IRecvWrapper:
 
     def maybe_irecv(self) -> None:
         if self.work_item is None:
-            self.work_item = torch.distributed.irecv(self.tensor, src=None, tag=self.tag, group=self.group)
+            # FIXME(tom) should use irecv but src=None is not currently supported
+            # see https://github.com/pytorch/pytorch/pull/47137
+            if False:
+                self.work_item = torch.distributed.irecv(self.tensor, src=None, tag=self.tag, group=self.group)
+            else:
+                self.work_item = self.group.recv_anysource([self.tensor], self.tag)
 
     def is_completed(self) -> bool:
         return (self.work_item is not None) and self.work_item.is_completed()
