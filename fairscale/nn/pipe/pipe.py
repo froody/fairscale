@@ -461,7 +461,7 @@ class Pipe(Module):
         deferred_batch_norm: bool = False,
         pipelined_backward: bool = None,
         retain_graph: bool = False,
-        loss_fn: Optional[nn.Module] = None,
+        loss_func: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
 
@@ -487,7 +487,6 @@ class Pipe(Module):
         self.pipelined_backward = pipelined_backward
         self.retain_graph = retain_graph
         self.pipeline: Optional[Pipeline]
-        self.loss_fn = loss_fn
         self.lock = threading.Lock()
 
         self.group = group
@@ -535,6 +534,10 @@ class Pipe(Module):
                 self.group = get_pipeline_parallel_group()
             assert self.group
 
+            assert (
+                loss_func is None or style is PipelineStyle.AsyncSchedule
+            ), "loss_func is only valid for PipelineStyle.AsyncSchedule"
+
             if devices is not None:
                 raise ValueError("'devices' argument only applies to 'PipelineStyle.SingleProcess'")
 
@@ -573,7 +576,6 @@ class Pipe(Module):
                 self.final_stage = False
             else:
                 self.final_stage = rank == len(self.balance) - 1
-                assert loss_fn is None or self.final_stage
 
                 self.pipeline = Pipeline(
                     cast(List[nn.Sequential], self.mp_partitions),
@@ -586,6 +588,7 @@ class Pipe(Module):
                     worker_map=self.worker_map,
                     input_device=self.input_device,
                     final_stage=self.final_stage,
+                    loss_func=loss_func,
                 )
                 del module
             if self.pipelined_backward is None:
@@ -691,7 +694,7 @@ class Pipe(Module):
 
         return self._copy_streams
 
-    def forward(self, input: TensorOrTensors, *, event=None) -> TensorOrTensors:  # type: ignore
+    def forward(self, input: TensorOrTensors, *, event=None, target=None) -> TensorOrTensors:  # type: ignore
         """:class:`Pipe` is a fairly transparent module wrapper. It doesn't
         modify the input and output signature of the underlying module. But
         there's type restriction. Input and output have to be a
@@ -721,9 +724,12 @@ class Pipe(Module):
         # Divide a mini-batch into micro-batches.
         batches = microbatch.scatter(input, self.chunks)
 
+        if target is not None:
+            target = microbatch.scatter(target, self.chunks)
+
         # Run pipeline parallelism.
         with self.lock:
-            self.pipeline.run(self.training, batches, event)
+            self.pipeline.run(self.training, batches, event, target=target)
 
             if self.group and not self.final_stage:
                 # Don't merge micro-batches to avoid unnecessary edges in autograd
@@ -745,6 +751,10 @@ class Pipe(Module):
                     output = PipelinedBackwardPass.apply(output, batches, phony, True)  # self.retain_graph)
                 else:
                     output = microbatch.gather(batches)
+
+                if target is not None:
+                    # FIXME(tom) weighted mean if uneven shard
+                    output = torch.mean(output).reshape(1)
 
             return output
 

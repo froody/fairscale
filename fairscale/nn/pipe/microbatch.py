@@ -189,7 +189,10 @@ def gather(outputs: List[Batch]) -> TensorOrTensors:
     output: TensorOrTensors
 
     if outputs[0].atomic:
-        tensors = tuple(b.tensor for b in outputs)
+        if len(outputs[0].tensor.size()) == 0:
+            tensors = tuple(b.tensor.view(1) for b in outputs)
+        else:
+            tensors = tuple(b.tensor for b in outputs)
         output = torch.cat(tensors)
     else:
         rotated = [b.tensors for b in outputs]

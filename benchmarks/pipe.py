@@ -287,15 +287,15 @@ def train(lm_dataloader, model, criterion, optimizer, vocab_size, args):
         if torch.cuda.is_available():
             total = total.cuda()
         torch.distributed.all_reduce(total, group=model.group)
-        logging.info(
+        print(
             f"training model, #prams = {num_params}, group: {model.group.rank()}, grank:"
             f" {torch.distributed.get_rank()}, sizes {model.group.size()}"
         )
         torch.distributed.barrier()
         if model.group.rank() == 0:
-            logging.info(f"total #prams = {total.item()}")
+            print(f"total #prams = {total.item()}")
     else:
-        logging.info(f"training model, #prams = {num_params}")
+        print(f"training model, #prams = {num_params}")
     vocab_size = 10000  # FIXME
     total_loss = 0.0
     start_time = time.time()
@@ -614,8 +614,8 @@ best_device_map = {
 
 
 def bench_mpi(args):
-    import torch_pg
-    torch_pg.init_mpi()
+    #import torch_pg
+    #torch_pg.init_mpi()
 
 
     guess_rank = int(os.environ["OMPI_COMM_WORLD_RANK"])

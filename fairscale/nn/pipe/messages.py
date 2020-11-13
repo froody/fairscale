@@ -160,6 +160,7 @@ class RpcTransport(Transport):
 
 class SendRecvTransport(Transport):
     def send_message(self, message: PipeMessage, sync: bool = False, skip_header: bool = False) -> None:
+        torch.cuda.synchronize()
         tensors = message.tensors
         message.tensors = tuple()
         torch.cuda.current_stream().synchronize()
@@ -175,8 +176,10 @@ class SendRecvTransport(Transport):
         for index, t in enumerate(tensors):
             if t.device.type == "cpu":
                 t = t.cuda()
+            tmp = t.contiguous()
+            torch.cuda.current_stream().synchronize()
             torch.distributed.send(
-                t.contiguous(), message.dest, tag=message.tag + index, group=get_pipeline_parallel_group()
+                tmp.contiguous(), message.dest, tag=message.tag + index, group=get_pipeline_parallel_group()
             )
 
     def recv_message_header(
@@ -189,7 +192,7 @@ class SendRecvTransport(Transport):
         if tensor is None:
             tensor = torch.empty(MESSAGE_TENSOR_SIZE, dtype=torch.uint8, device=self.input_device)
             torch.cuda.current_stream().synchronize()
-            torch.distributed.recv(tensor, src=None, tag=queue_name, group=get_pipeline_parallel_group())
+            sender = torch.distributed.recv(tensor, src=None, tag=queue_name, group=get_pipeline_parallel_group())
             torch.cuda.current_stream().synchronize()
         else:
             torch.cuda.current_stream().synchronize()
@@ -202,7 +205,7 @@ class SendRecvTransport(Transport):
         message_tensors = []
         for index, (shape, dtype) in enumerate(zip(message.tensor_shapes, message.tensor_dtypes)):
             t = torch.empty(*shape, dtype=dtype, device=self.input_device)
-            torch.distributed.recv(t, message.src, tag=message.tag + index, group=get_pipeline_parallel_group())
+            sender = torch.distributed.recv(t, message.src, tag=message.tag + index, group=get_pipeline_parallel_group())
             message_tensors.append(t)
 
         message.tensors = tuple(message_tensors)

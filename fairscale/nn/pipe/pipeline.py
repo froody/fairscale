@@ -168,6 +168,8 @@ def create_task(
     partition: nn.Sequential,
     skip_trackers: List[SkipTrackerThroughPotals],
     streams: List[AbstractStream],
+    target=None,
+    loss_func=None,
 ) -> Task:
     # Determine whether checkpointing or not.
     if i < checkpoint_stop:
@@ -178,9 +180,14 @@ def create_task(
             skip_tracker: SkipTrackerThroughPotals = skip_trackers[i],
             chunk_id: int = i,
             part_id: int = j,
+            target=target,
+            loss_func=loss_func,
         ) -> TensorOrTensors:
             with use_skip_tracker(skip_tracker), record_function("chunk%d-part%d" % (chunk_id, part_id)):
-                return partition(input)
+                result = partition(input)
+                if loss_func and target is not None:
+                    result = loss_func(result, target.tensor_or_tensors)
+                return result
 
         chk = Checkpointing(function, batch)
         if style is PipelineStyle.SingleProcess:
@@ -197,9 +204,14 @@ def create_task(
             skip_tracker: SkipTrackerThroughPotals = skip_trackers[i],
             chunk_id: int = i,
             part_id: int = j,
+            target=target,
+            loss_func=loss_func,
         ) -> Batch:
             with use_skip_tracker(skip_tracker), record_function("chunk%d-part%d" % (chunk_id, part_id)):
-                return batch.call(partition)
+                result = batch.call(partition)
+                if loss_func and target is not None:
+                    result = Batch(loss_func(result.tensor_or_tensors, target.tensor_or_tensors), result.index)
+                return result
 
         if style is PipelineStyle.SingleProcess:
             task = Task(streams[j], compute=compute, finalize=None)
@@ -225,6 +237,7 @@ class Pipeline:
         worker_map: Optional[Dict[int, str]] = None,
         input_device: Union[None, int, str, torch.device] = None,
         final_stage: bool = False,
+        loss_func: Optional[nn.Module] = None,
     ) -> None:
         if style == PipelineStyle.SingleProcess:
             self.partitions = partitions
@@ -237,6 +250,7 @@ class Pipeline:
         self.style = style
         self.group = group
         self.training: bool
+        self.loss_func = loss_func
         if style in [PipelineStyle.MultiProcess, PipelineStyle.AsyncSchedule]:
             self.transport = MakeTransport(
                 use_rpc=("OMPI_COMM_WORLD_RANK" not in os.environ) or ("FORCE_RPC" in os.environ),
@@ -266,7 +280,7 @@ class Pipeline:
         if self.style is PipelineStyle.SingleProcess:
             join_workers(self.in_queues, self.out_queues)
 
-    def run(self, training: bool, batches: List[Batch], event: Optional[Event]) -> None:
+    def run(self, training: bool, batches: List[Batch], event: Optional[Event] = None, target=None) -> None:
 
         """Runs pipeline parallelism.
 
@@ -292,21 +306,26 @@ class Pipeline:
             assert self.group
             rank = self.group.rank()
             event_loop = AsyncEventLoop(
-                self.mp_partitions, self.group, self.transport, self.training, self.checkpoint_stop,
+                self.mp_partitions,
+                self.group,
+                self.transport,
+                self.training,
+                self.checkpoint_stop,
+                loss_func=self.loss_func,
             )
             try:
                 if rank == 0 and not self.final_stage:
-                    logging.debug(f"{torch.distributed.get_rank()}: entered event head")
+                    print(f"{torch.distributed.get_rank()}: entered event head")
                     self.head_ctx = event_loop.event_loop_head(batches, skip_trackers, event)
-                    logging.debug(f"{torch.distributed.get_rank()}: exited event head")
+                    print(f"{torch.distributed.get_rank()}: exited event head")
                 elif self.final_stage:
-                    logging.debug(f"{torch.distributed.get_rank()}: entered event tail")
-                    event_loop.event_loop_tail(batches, skip_trackers)
-                    logging.debug(f"{torch.distributed.get_rank()}: exited event tail")
+                    print(f"{torch.distributed.get_rank()}: entered event tail")
+                    event_loop.event_loop_tail(batches, skip_trackers, target=target)
+                    print(f"{torch.distributed.get_rank()}: exited event tail")
                 else:
-                    logging.debug(f"{torch.distributed.get_rank()}: entered event loop")
+                    print(f"{torch.distributed.get_rank()}: entered event loop")
                     event_loop.event_loop(len(batches), skip_trackers)
-                    logging.debug(f"{torch.distributed.get_rank()}: exited event loop")
+                    print(f"{torch.distributed.get_rank()}: exited event loop")
             except Exception as e:
                 print(f"event loop bad")
                 print(f"event loop bad {e}")
@@ -564,6 +583,7 @@ class Pipeline:
             )
             assert self.head_ctx
             event_loop.head_backwards(self.head_ctx)
+            del self.head_ctx
             return
 
         o = list(output)

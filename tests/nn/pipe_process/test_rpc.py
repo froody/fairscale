@@ -71,6 +71,12 @@ def check_pipe_against_reference(balance, model_constructor, checkpoint="except_
     reference_model = nn.Sequential(*reference_model).cuda()
     nbatch = 100
 
+    pipe_loss = True
+    if pipe_loss:
+        loss_func = nn.MSELoss()
+    else:
+        loss_func = None
+
     pipe = PipeRPCWrapper(
         model,
         balance,
@@ -78,6 +84,7 @@ def check_pipe_against_reference(balance, model_constructor, checkpoint="except_
         worker_map=get_worker_map(),
         checkpoint=checkpoint,
         chunks=nbatch,
+        loss_func=loss_func
     )
 
     pipe.foreach_worker(register_optimizer, include_self=True)
@@ -86,25 +93,37 @@ def check_pipe_against_reference(balance, model_constructor, checkpoint="except_
     inputs = torch.rand(nbatch, 10).cuda()
     target = torch.rand(nbatch, 10).cuda()
     cloned = inputs.clone()
-    output = pipe(inputs)
+    if pipe_loss:
+        output = pipe(inputs, target=target)
+    else:
+        output = pipe(inputs)
     ref_out = reference_model(inputs)
 
     left = ref_out.cpu()
     right = output.cpu()
-    assert torch.allclose(ref_out.cpu(), output.cpu(), atol=1.0e-3)
-    assert torch.allclose(ref_out.cpu(), output.cpu(), atol=1.0e-4)
-    assert torch.allclose(ref_out.cpu(), output.cpu(), atol=1.0e-5)
-    assert torch.allclose(ref_out.cpu(), output.cpu(), atol=1.0e-6)
-    assert torch.allclose(ref_out.cpu(), output.cpu(), atol=1.0e-7)
+    if not pipe_loss:
+        assert torch.allclose(ref_out.cpu(), output.cpu(), atol=1.0e-3)
+        assert torch.allclose(ref_out.cpu(), output.cpu(), atol=1.0e-4)
+        assert torch.allclose(ref_out.cpu(), output.cpu(), atol=1.0e-5)
+        assert torch.allclose(ref_out.cpu(), output.cpu(), atol=1.0e-6)
+        assert torch.allclose(ref_out.cpu(), output.cpu(), atol=1.0e-7)
     # assert torch.allclose(ref_out.cpu(), output.cpu(), atol=1.0e-9)
     # assert torch.allclose(ref_out.cpu(), output.cpu(), atol=1.0e-11)
     # if not torch.equal(ref_out.cpu(), output.cpu()):
     # print(f"wat {left.tolist()}, {right.tolist()}, {left.tolist() == right.tolist()}")
 
-    for out in output, ref_out:
-        target = target.to(out.device)
-        loss = nn.MSELoss()(out, target)
-        loss.backward()
+    outputs = {"reference": ref_out, "pipe": output}
+
+    ref_loss = nn.MSELoss()(ref_out, target)
+    ref_loss.backward()
+
+    if pipe_loss:
+        loss = output
+    else:
+        loss = nn.MSELoss()(output, target)
+    loss.backward()
+
+    assert torch.allclose(ref_loss.cpu(), loss.cpu(), atol=1.0e-7)
 
     pipe.foreach_worker(step_optimizer, include_self=True)
     step_optimizer(None, reference_model.cuda())

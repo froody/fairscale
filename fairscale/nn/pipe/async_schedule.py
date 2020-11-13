@@ -168,6 +168,9 @@ class AsyncRecvOperator(torch.autograd.Function):
 
                 AsyncEventLoop.perform_backward_for_invocation(ctx.transport, message, tail_ctx.activations, invocation)
 
+            ctx.tail_ctx = None
+            del tail_ctx
+
         return (None, None, None, None, None)
 
 
@@ -179,12 +182,14 @@ class AsyncEventLoop:
         transport: Transport,
         training: bool,
         checkpoint_stop: int,
+        loss_func=None,
     ):
         self.training = training
         self.checkpoint_stop = checkpoint_stop
         self.transport = transport
         self.group = group
         self.partitions: List[ModuleWrapper] = partitions
+        self.loss_func = loss_func
 
     def send_async_message(self, dst_rank: int, result: Batch, invocation: Invocation) -> Batch:
         """Send batch to dst_rank, and use AutogradWithoutActivations to delete
@@ -215,11 +220,17 @@ class AsyncEventLoop:
         partition: ModuleWrapper,
         skip_trackers: List[SkipTrackerThroughPotals],
         invocation: Invocation,
+        target=None,
     ) -> Batch:
         """Actually run the forward pass for a given module, and send the result
         to the next stage in the pipeline if needed."""
         assert self.group
         from .pipeline import create_task
+
+        target_args = {}
+        if self.training and target and self.loss_func and invocation.dest is None:
+            target_args["target"] = target.pop(0)
+            target_args["loss_func"] = self.loss_func
 
         task = create_task(
             PipelineStyle.AsyncSchedule,
@@ -230,6 +241,7 @@ class AsyncEventLoop:
             partition.module,
             skip_trackers,
             [],
+            **target_args,
         )
         result = task.compute()
         task.finalize(result)
@@ -255,6 +267,7 @@ class AsyncEventLoop:
         # so we store the gradients in `grad_from_pipeline` so it will be used
         # during the backward pass
         batch.tensor.grad_fn.grad_from_pipeline = tuple(recvd_grads.tensors)  # type: ignore
+        # torch.autograd.backward(batch.tensor_or_tensors, grad_tensors=recvd_grads.tensors, retain_graph=True)
         batch.tensor.backward(retain_graph=True)
 
     def run_invocations_on_batch(
@@ -264,6 +277,7 @@ class AsyncEventLoop:
         order: int,
         skip_trackers: List[SkipTrackerThroughPotals],
         activations: Activations,
+        target=None,
     ) -> Tuple[int, int]:
         """Run invocations on the batch until we hit one that receives its input
         from a different stage (i.e. another process)"""
@@ -280,14 +294,14 @@ class AsyncEventLoop:
                 invocations_handled += 1
                 last_order = invocation.order
                 activations[pi][invocation.order][batch.index] = self.run_invocation(
-                    batch, partition, skip_trackers, invocation
+                    batch, partition, skip_trackers, invocation, target=target
                 )
             elif invocation.source and invocation.source.stage == self.group.rank():
                 invocations_handled += 1
                 last_order = invocation.order
                 batch = activations[invocation.source.index][invocation.order - 1][batch.index]
                 activations[pi][invocation.order][batch.index] = self.run_invocation(
-                    batch, partition, skip_trackers, invocation
+                    batch, partition, skip_trackers, invocation, target=target
                 )
                 del activations[invocation.source.index][invocation.order - 1][batch.index]
 
@@ -306,9 +320,10 @@ class AsyncEventLoop:
         invocations, activations = self.get_invocations_and_activations()
 
         count_per_order: Dict[int, int] = dict()
+        num_batches = len(batches)
 
         self.event_loop_inner(
-            len(batches),
+            num_batches,
             skip_trackers,
             activations,
             invocations,
@@ -319,7 +334,7 @@ class AsyncEventLoop:
         )
 
         if self.training:
-            return BackwardContext(activations, invocations, count_per_order, num_batches=len(batches))
+            return BackwardContext(activations, invocations, count_per_order, num_batches=num_batches)
         else:
             return None
 
@@ -348,7 +363,7 @@ class AsyncEventLoop:
             batch = Batch(result, microbatch_index)
         return batch
 
-    def event_loop_tail(self, batches: List[Batch], skip_trackers: List[SkipTrackerThroughPotals]) -> None:
+    def event_loop_tail(self, batches: List[Batch], skip_trackers: List[SkipTrackerThroughPotals], target=None) -> None:
         """The event loop for the "tail", or final stage which only processes
         activations and then returns to the caller so that the loss can be
         calculated. This also handles the first/only stage for the special
@@ -369,6 +384,7 @@ class AsyncEventLoop:
             ignore_gradients=True,
             tail=True,
             batches=batches if rank == 0 else None,
+            target=target,
         )
 
         _, last_invocation = invocations.popitem()
@@ -411,6 +427,7 @@ class AsyncEventLoop:
         ignore_gradients: bool = False,
         event: Optional[Event] = None,
         tail: bool = False,
+        target=None,
     ) -> None:
         """The common event loop shared by all stages. This processses
         activations for the forward pass, and if `self.training` is true,
@@ -429,7 +446,7 @@ class AsyncEventLoop:
             num_activations = 0
 
         stashed_messages: Dict[Tuple[int, int], PipeMessage] = dict()
-        batch_iter = list(batches) if batches else []
+        batch_iter = batches or []
 
         receiving_invocations = sum(inv.receives_activation() for inv in invocations.values())
         expected_recv = receiving_invocations * num_batches
@@ -496,13 +513,15 @@ class AsyncEventLoop:
                     invocation = invocations[0]
 
                 inv_count, last_order = self.run_invocations_on_batch(
-                    batch, invocations, invocation.order, skip_trackers, activations
+                    batch, invocations, invocation.order, skip_trackers, activations, target=target
                 )
 
                 count_per_order[last_order] = inv_count
                 num_activations += inv_count
                 if tail and invocations[last_order].dest is None:
                     self.prepare_tail_backward(batch, activations, invocations, count_per_order)
+
+                del batch
 
                 assert num_activations <= expected_invocations
 

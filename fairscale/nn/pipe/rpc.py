@@ -42,6 +42,19 @@ def get_dtype(tensor: TensorOrTensors) -> DtypeOrDtypes:
         return [t.dtype for t in tensor]
 
 
+def recv_message_tensors(transport, message: PipeMessage, shapes: SizeOrSizes, dtypes: DtypeOrDtypes):
+    if isinstance(shapes, torch.Size):
+        message.tensor_shapes = [cast(torch.Size, shapes)]
+        message.tensor_dtypes = [cast(torch.dtype, dtypes)]
+        message = transport.recv_message_tensors(message)
+        return message.tensors[0]
+    else:
+        message.tensor_shapes = cast(List[torch.Size], shapes)
+        message.tensor_dtypes = cast(List[torch.dtype], dtypes)
+        message = transport.recv_message_tensors(message)
+        return message.tensors
+
+
 def get_global_ranks_from_group(group: ProcessGroup) -> List[int]:
     return [_get_global_rank(group, r) for r in range(group.size())]
 
@@ -77,6 +90,9 @@ def callback_with_model(callback: Callable[[Any, Pipe], None], ctx: Any) -> None
             callback(ctx, PipeModel)
     except Exception as e:
         print(f"Exception raised in rpc callback: {e}")
+        import traceback
+
+        print(f"exc = {traceback.format_exc()}")
         raise e
 
 
@@ -110,11 +126,14 @@ class PipeRPCWrapper(nn.Module):
         torch.futures.wait_all(self._foreach_worker(self._register_remote_model, args=(args, kwargs)))
         self.model.cuda()
 
-    def _get_rpc_name(self, rank: int) -> str:
+    def _get_rpc_name_from_group_rank(self, rank: int) -> str:
         return self.worker_map[_get_global_rank(self.group, rank)]
 
     def _foreach_worker(self, callback: Callable, args: Any = None) -> List[torch.futures.Future]:
-        return [rpc.rpc_async(self._get_rpc_name(rank), callback, args=args) for rank in range(1, self.group.size())]
+        return [
+            rpc.rpc_async(self._get_rpc_name_from_group_rank(rank), callback, args=args)
+            for rank in range(1, self.group.size())
+        ]
 
     def foreach_worker(
         self, callback: Callable[[Any, Pipe], None], ctx: Any = None, *, include_self: bool = False
@@ -139,28 +158,68 @@ class PipeRPCWrapper(nn.Module):
             with self.model.lock:
                 callback(ctx, self.model)
 
-    def forward(self, tensor: TensorOrTensors) -> TensorOrTensors:  # type: ignore
+    def forward(self, tensor: TensorOrTensors, target: Optional[TensorOrTensors] = None) -> TensorOrTensors:  # type: ignore
         shape = get_shapes(tensor)
         dtype = get_dtype(tensor)
+        queue = EVENT_LOOP_QUEUE
 
         if isinstance(tensor, torch.Tensor):
             num_tensors = 1
         else:
             num_tensors = len(tensor)
 
-        futures = self._foreach_worker(self._model_forward, args=(self.model.training, shape, dtype))
+        if target is None:
+            futures = self._foreach_worker(self._model_forward, args=(self.model.training, shape, dtype))
+        else:
+            futures = [
+                rpc.rpc_async(
+                    self._get_rpc_name_from_group_rank(rank),
+                    self._model_forward,
+                    args=(self.model.training, shape, dtype),
+                )
+                for rank in range(1, self.group.size() - 1)
+            ]
+            if isinstance(target, torch.Tensor):
+                num_targets = 1
+                target_shape = [get_shapes(target)]
+                target_dtype = [get_dtype(target)]
+                target_tensor = (target,)
+            else:
+                num_targets = len(target)
+                target_shape = get_shapes(target)
+                target_dtype = get_dtype(target)
+                target_tensor = target
+
+            target_rank = self.group.size() - 1  # FIXME(tom) with reuse, last stage might not be on rank -1?
+            target_msg = PipeMessage(
+                torch.distributed.get_rank(),
+                _get_global_rank(self.group, target_rank),
+                queue_name=queue,
+                tensor_count=num_targets,
+            )
+            target_msg.tensor_dtypes = target_dtype
+            target_msg.tensor_shapes = target_shape
+
+            futures.append(
+                rpc.rpc_async(
+                    self._get_rpc_name_from_group_rank(target_rank),
+                    self._model_forward,
+                    args=(self.model.training, shape, dtype, target_msg),
+                )
+            )
+            target_msg.tensors = target_tensor
+            self.model.pipeline.transport.send_message(target_msg, sync=True, skip_header=True)
 
         if self.model.final_stage:
-            return self.model(tensor)
+            return self.model(tensor, target=target)
         else:
             self.model(tensor)
 
             shape, dtype = futures.pop().wait()
             dest_rank = self.group.size() - 1
-            dest = self._get_rpc_name(dest_rank)
+            dest = self._get_rpc_name_from_group_rank(dest_rank)
             dest_global_rank = _get_global_rank(self.group, dest_rank)
             src_global_rank = torch.distributed.get_rank()
-            queue = EVENT_LOOP_QUEUE
 
             activations = PipeMessage(dest_global_rank, src_global_rank, queue_name=queue, tensor_count=num_tensors)
             grads = PipeMessage(src_global_rank, dest_global_rank, queue_name=queue, tensor_count=num_tensors)
@@ -192,17 +251,7 @@ class PipeRPCWrapper(nn.Module):
 
         assert self.model.pipeline
         transport = self.model.pipeline.transport
-
-        if isinstance(shapes, torch.Size):
-            message.tensor_shapes = [cast(torch.Size, shapes)]
-            message.tensor_dtypes = [cast(torch.dtype, dtypes)]
-            message = transport.recv_message_tensors(message)
-            return message.tensors[0]
-        else:
-            message.tensor_shapes = cast(List[torch.Size], shapes)
-            message.tensor_dtypes = cast(List[torch.dtype], dtypes)
-            message = transport.recv_message_tensors(message)
-            return message.tensors
+        return recv_message_tensors(transport, message, shapes, dtypes)
 
     @staticmethod
     def _send_result_and_do_backwards(training: bool, message: PipeMessage, grads_message: PipeMessage) -> None:
@@ -229,6 +278,9 @@ class PipeRPCWrapper(nn.Module):
                     torch.autograd.backward(result, grads_message.tensors, retain_graph=True)
         except Exception as e:
             print(f"Exception raised in rpc callback: {e}")
+            import traceback
+
+            print(f"exc = {traceback.format_exc()}")
             raise e
 
     @staticmethod
@@ -244,12 +296,22 @@ class PipeRPCWrapper(nn.Module):
 
     @staticmethod
     def _model_forward(
-        training: bool, shape: torch.Size, dtype: torch.dtype
+        training: bool, shape: torch.Size, dtype: torch.dtype, target: Optional[PipeMessage] = None
     ) -> Optional[Tuple[SizeOrSizes, DtypeOrDtypes]]:
         try:
             model = PipeModel
             assert model.group
             set_device_based_on_group(model.group)
+
+            if target:
+                target = model.pipeline.transport.recv_message_tensors(target)
+                torch.cuda.synchronize()
+                if len(target.tensor_shapes) == 1:
+                    target_tensors = target.tensors[0]
+                else:
+                    target_tensors = target.tensors
+            else:
+                target_tensors = None
 
             if isinstance(shape, torch.Size):
                 tensor = torch.empty(shape, dtype=dtype)
@@ -257,7 +319,11 @@ class PipeRPCWrapper(nn.Module):
                 tensor = tuple([torch.empty(s, dtype=d) for s, d in zip(shape, dtype)])
 
             model.train(training)
-            result = model(tensor)
+            if target_tensors is None:
+                result = model(tensor)
+            else:
+                result = model(tensor, target=target_tensors)
+
             if model.final_stage:
                 global PipeResult
                 PipeResult = result
@@ -266,4 +332,7 @@ class PipeRPCWrapper(nn.Module):
             return None
         except Exception as e:
             print(f"Exception raised in rpc callback: {e}")
+            import traceback
+
+            print(f"exc = {traceback.format_exc()}")
             raise e
