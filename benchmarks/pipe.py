@@ -614,8 +614,8 @@ best_device_map = {
 
 
 def bench_mpi(args):
-    #import torch_pg
-    #torch_pg.init_mpi()
+    import torch_pg
+    torch_pg.init_mpi()
 
 
     guess_rank = int(os.environ["OMPI_COMM_WORLD_RANK"])

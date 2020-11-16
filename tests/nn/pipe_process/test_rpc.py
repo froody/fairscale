@@ -11,8 +11,8 @@ from fairscale.nn.pipe import PipeRPCWrapper
 from tests.nn.model_parallel.commons import get_worker_map, torch_spawn
 
 
-def init_rpc():
-    os.environ["MASTER_PORT"] = "10639"
+def init_rpc(offset=0):
+    os.environ["MASTER_PORT"] = f"{10639 + offset}"
     init_method = f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}"
     rpc.init_rpc(
         f"Test{torch.distributed.get_rank()}",
@@ -84,7 +84,7 @@ def check_pipe_against_reference(balance, model_constructor, checkpoint="except_
         worker_map=get_worker_map(),
         checkpoint=checkpoint,
         chunks=nbatch,
-        loss_func=loss_func
+        loss_func=loss_func,
     )
 
     pipe.foreach_worker(register_optimizer, include_self=True)
@@ -140,9 +140,9 @@ def check_pipe_against_reference(balance, model_constructor, checkpoint="except_
 
 @torch_spawn([3])
 @pytest.mark.skipif("OMPI_COMM_WORLD_RANK" not in os.environ, reason="mpi required")
-def rpc_optimizer():
-
-    init_rpc()
+@pytest.mark.parametrize("checkpoint", ["never", "always", "except_last"])
+def rpc_optimizer(checkpoint):
+    init_rpc({"never": 0, "always": 1, "except_last": 2}[checkpoint])
     if torch.distributed.get_rank() != 0:
         rpc.shutdown()
         torch.distributed.barrier()
@@ -153,9 +153,11 @@ def rpc_optimizer():
         return [reused_1, nn.ReLU(), reused_1, nn.ReLU(), reused_1, nn.ReLU()]
 
     check_pipe_against_reference(
-        [2, 2, 2], lambda: [nn.Linear(10, 10), nn.ReLU(), nn.Linear(10, 10), nn.ReLU(), nn.Linear(10, 10), nn.ReLU()],
+        [2, 2, 2],
+        lambda: [nn.Linear(10, 10), nn.ReLU(), nn.Linear(10, 10), nn.ReLU(), nn.Linear(10, 10), nn.ReLU()],
+        checkpoint=checkpoint,
     )
-    check_pipe_against_reference([2, 1, 1], model_with_reuse)
+    check_pipe_against_reference([2, 1, 1], model_with_reuse, checkpoint=checkpoint)
 
     rpc.shutdown()
     torch.distributed.barrier()

@@ -170,6 +170,7 @@ def create_task(
     streams: List[AbstractStream],
     target=None,
     loss_func=None,
+    should_split=False,
 ) -> Task:
     # Determine whether checkpointing or not.
     if i < checkpoint_stop:
@@ -193,7 +194,10 @@ def create_task(
         if style is PipelineStyle.SingleProcess:
             task = Task(streams[j], compute=chk.checkpoint, finalize=chk.recompute)
         elif style in [PipelineStyle.MultiProcess, PipelineStyle.AsyncSchedule]:
-            task = Task(None, compute=chk.checkpoint, finalize=chk.recompute)
+            if should_split:
+                task = Task(None, compute=chk.checkpoint, finalize=None, split=chk.split)
+            else:
+                task = Task(None, compute=chk.checkpoint, finalize=chk.recompute)
         del function, chk  # TODO(tom) maybe remove
 
     else:
@@ -315,17 +319,17 @@ class Pipeline:
             )
             try:
                 if rank == 0 and not self.final_stage:
-                    print(f"{torch.distributed.get_rank()}: entered event head")
+                    logging.debug(f"{torch.distributed.get_rank()}: entered event head")
                     self.head_ctx = event_loop.event_loop_head(batches, skip_trackers, event)
-                    print(f"{torch.distributed.get_rank()}: exited event head")
+                    logging.debug(f"{torch.distributed.get_rank()}: exited event head")
                 elif self.final_stage:
-                    print(f"{torch.distributed.get_rank()}: entered event tail")
+                    logging.debug(f"{torch.distributed.get_rank()}: entered event tail")
                     event_loop.event_loop_tail(batches, skip_trackers, target=target)
-                    print(f"{torch.distributed.get_rank()}: exited event tail")
+                    logging.debug(f"{torch.distributed.get_rank()}: exited event tail")
                 else:
-                    print(f"{torch.distributed.get_rank()}: entered event loop")
+                    logging.debug(f"{torch.distributed.get_rank()}: entered event loop")
                     event_loop.event_loop(len(batches), skip_trackers)
-                    print(f"{torch.distributed.get_rank()}: exited event loop")
+                    logging.debug(f"{torch.distributed.get_rank()}: exited event loop")
             except Exception as e:
                 print(f"event loop bad")
                 print(f"event loop bad {e}")

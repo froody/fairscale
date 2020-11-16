@@ -115,6 +115,15 @@ class Checkpointing:
         phony = Recompute.apply(phony, self.recomputed, self.rng_states, self.function, input_atomic, *input)
         batch[0] = join(batch[0], phony)
 
+    def split(self, batch: Batch) -> None:
+        """Applies :class:`Recompute` to the batch in place."""
+        input_atomic = self.batch.atomic
+        input = tuple(self.batch)
+
+        phony = torch.tensor(1.0, device=self.batch[0].device, requires_grad=True)
+        input_leaf = tuple(x.detach().requires_grad_(x.requires_grad) for x in input)
+        return Recompute.apply(phony, self.recomputed, self.rng_states, self.function, input_atomic, *input_leaf)
+
 
 class ThreadLocal(threading.local):
     def __init__(self) -> None:
