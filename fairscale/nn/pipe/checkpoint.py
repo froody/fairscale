@@ -74,6 +74,9 @@ class Function(Protocol):
         ...
 
 
+the_phony = dict()
+
+
 class Checkpointing:
     """Generates a pair of :class:`Checkpoint` and :class:`Recompute`."""
 
@@ -120,7 +123,11 @@ class Checkpointing:
         input_atomic = self.batch.atomic
         input = tuple(self.batch)
 
-        phony = torch.tensor(1.0, device=self.batch[0].device, requires_grad=True)
+        device = self.batch[0].device
+        phony = the_phony.get(device, None)
+        if phony is None:
+            phony = torch.tensor(1.0, device=device, requires_grad=True)
+            the_phony[device] = phony
         input_leaf = tuple(x.detach().requires_grad_(x.requires_grad) for x in input)
         return Recompute.apply(phony, self.recomputed, self.rng_states, self.function, input_atomic, *input_leaf)
 

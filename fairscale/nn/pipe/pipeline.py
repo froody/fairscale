@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple, Type, U
 import torch
 from torch import Tensor, nn
 from torch.autograd.profiler import record_function
+import torch.autograd.profiler as profiler
 
 from fairscale.nn.model_parallel import get_pipeline_parallel_ranks
 
@@ -187,7 +188,9 @@ def create_task(
             with use_skip_tracker(skip_tracker), record_function("chunk%d-part%d" % (chunk_id, part_id)):
                 result = partition(input)
                 if loss_func and target is not None:
+                    #print(f"check loss")
                     result = loss_func(result, target.tensor_or_tensors)
+                    del target
                 return result
 
         chk = Checkpointing(function, batch)
@@ -215,6 +218,7 @@ def create_task(
                 result = batch.call(partition)
                 if loss_func and target is not None:
                     result = Batch(loss_func(result.tensor_or_tensors, target.tensor_or_tensors), result.index)
+                    del target
                 return result
 
         if style is PipelineStyle.SingleProcess:
@@ -255,6 +259,7 @@ class Pipeline:
         self.group = group
         self.training: bool
         self.loss_func = loss_func
+        print(f"make pipe {loss_func is None}")
         if style in [PipelineStyle.MultiProcess, PipelineStyle.AsyncSchedule]:
             self.transport = MakeTransport(
                 use_rpc=("OMPI_COMM_WORLD_RANK" not in os.environ) or ("FORCE_RPC" in os.environ),

@@ -228,7 +228,7 @@ class AsyncEventLoop:
         from .pipeline import create_task
 
         target_args = {}
-        if self.training and target and self.loss_func and invocation.dest is None:
+        if self.training and None not in (target, self.loss_func) and invocation.dest is None:
             target_args["target"] = target.pop(0)
             target_args["loss_func"] = self.loss_func
 
@@ -247,6 +247,7 @@ class AsyncEventLoop:
             **target_args,
             should_split=should_split,
         )
+        del target_args
         result = task.compute()
 
         if should_split:

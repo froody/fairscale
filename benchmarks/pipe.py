@@ -25,6 +25,8 @@ from fairscale.optim import GradScaler
 from fairscale.optim.oss import OSS
 from tests.nn.model_parallel.commons import dist_init, get_worker_map
 
+import torch.autograd.profiler as profiler
+
 try:
     from fairscale.optim import Adam  # type: ignore
 
@@ -347,6 +349,7 @@ def train(lm_dataloader, model, criterion, optimizer, vocab_size, args):
 
         lm_dataloader = FakeDataset()
 
+    pipe_loss = True
     for i, batch in enumerate(lm_dataloader):
         bi = batch["input"]
         if args.max_batch and i > args.max_batch:
@@ -355,24 +358,39 @@ def train(lm_dataloader, model, criterion, optimizer, vocab_size, args):
         try:
             if (pipe_group is None or pipe_group.rank() == 0) and not args.ddp_zero:
                 tmp = batch["input"].to(get_first_device(model))
-                output = model(tmp)
+                if pipe_loss:
+                    target = batch["target"].to(get_first_device(model))
+                    output = model(tmp, target=target)
+                else:
+                    output = model(tmp)
             else:
-                output = model(batch["input"])
+                if pipe_loss and "target" in batch:
+                    target = batch["target"].to(get_first_device(model))
+                    output = model(batch["input"], target=target)
+                else:
+                    output = model(batch["input"])
         except Exception as e:
             raise RuntimeError(f"training failed on {torch.distributed.get_rank()}") from e
 
         if pipe_group is None or pipe_group.rank() == pipe_group.size() - 1:
-            target = batch["target"].to(get_last_device(model))
-            output = output.to(target.device)
+            if pipe_loss:
+                loss = output
+            else:
+                target = batch["target"].to(get_last_device(model))
+                output = output.to(target.device)
 
-            loss = criterion(output.view(-1, vocab_size), target.view(-1))
+                loss = criterion(output.view(-1, vocab_size), target.view(-1))
             if args.ddp_zero:
                 ddp_group = get_data_parallel_group()
                 torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.SUM, group=ddp_group)
                 loss /= ddp_group.size()
+
+            # with profiler.profile(record_shapes=True, profile_memory=True) as prof:
+            #    with profiler.record_function("tail-backward"):
             loss.backward()
+            # print(prof.key_averages().table())
             del target
-        elif pipe_group.rank() == 0: # FIXME
+        elif pipe_group.rank() == 0:  # FIXME
             if args.ddp_zero:
                 model.module.back_helper(output)
             else:
@@ -398,6 +416,7 @@ def train(lm_dataloader, model, criterion, optimizer, vocab_size, args):
                 word_counter = 0
                 total_loss = 0
                 start_time = time.time()
+            del loss
         # if i >= 10:
         #    break
         # torch.cuda.empty_cache()
@@ -556,6 +575,9 @@ def run_mp_worker(args, available_workers):
     blob = make_model_and_data(args, None, new_data=new_data)
     model = blob["model"]
 
+    def crit(output, target, vocab_size=blob["vocab_size"], criterion=blob["criterion"]):
+        return criterion(output.view(-1, vocab_size), target.view(-1))
+
     balance = generate_balance_weighted(get_pipeline_parallel_group().size(), len(model), 0.8)
     p = pipe.Pipe(
         model,
@@ -566,10 +588,11 @@ def run_mp_worker(args, available_workers):
         input_device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"),
         pipelined_backward=args.pipelined_backward,
         checkpoint=args.checkpoint,
-        # loss_fn=blob["criterion"],
+        loss_func=crit,
     )
     if torch.cuda.is_available():
         p = p.cuda()
+
     if args.all_at_once and p.pipeline:
         print(f"running all at once")
         p.pipeline.all_at_once = True
@@ -615,8 +638,8 @@ best_device_map = {
 
 def bench_mpi(args):
     import torch_pg
-    torch_pg.init_mpi()
 
+    torch_pg.init_mpi()
 
     guess_rank = int(os.environ["OMPI_COMM_WORLD_RANK"])
     world_size = int(os.environ["OMPI_COMM_WORLD_SIZE"])
