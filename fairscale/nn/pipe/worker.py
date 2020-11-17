@@ -78,9 +78,9 @@ class Task:
         with use_stream(self.stream), torch.set_grad_enabled(self._grad_enabled):
             return self._compute()
 
-    def split(self) -> torch.Tensor:
+    def split(self) -> Optional[torch.Tensor]:
         if self._split is None:
-            return
+            return None
         with use_stream(self.stream), torch.set_grad_enabled(self._grad_enabled):
             return self._split()
 

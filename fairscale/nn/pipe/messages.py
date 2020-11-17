@@ -205,7 +205,9 @@ class SendRecvTransport(Transport):
         message_tensors = []
         for index, (shape, dtype) in enumerate(zip(message.tensor_shapes, message.tensor_dtypes)):
             t = torch.empty(*shape, dtype=dtype, device=self.input_device)
-            sender = torch.distributed.recv(t, message.src, tag=message.tag + index, group=get_pipeline_parallel_group())
+            sender = torch.distributed.recv(
+                t, message.src, tag=message.tag + index, group=get_pipeline_parallel_group()
+            )
             message_tensors.append(t)
 
         message.tensors = tuple(message_tensors)

@@ -31,7 +31,6 @@ import torch.autograd
 import torch.cuda
 
 from fairscale.nn.model_parallel import get_model_parallel_world_size, get_pipeline_parallel_group
-import torch.autograd.profiler as profiler
 
 from . import microbatch
 from .async_schedule import Invocation, Location, ModuleWrapper
@@ -766,11 +765,13 @@ class Pipe(Module):
         if self.pipeline:
             self.pipeline.back_helper(list(reversed(output or [])))
 
+
 def fix_zero_dim(batch, tensor):
     if batch.atomic and len(tensor.size()) == 0:
         return tensor.view(1)
     else:
         return tensor
+
 
 class PipelinedBackwardPass(torch.autograd.Function):
     @staticmethod
@@ -791,9 +792,7 @@ class PipelinedBackwardPass(torch.autograd.Function):
             with torch.enable_grad():
                 tensors = fix_zero_dim(batch, batch.tensor_or_tensors)
 
-            torch.autograd.backward(
-                tensors, grad_tensors=(*grad,), retain_graph=ctx.retain_graph
-            )
+            torch.autograd.backward(tensors, grad_tensors=(*grad,), retain_graph=ctx.retain_graph)
 
         with torch.no_grad():
             if ctx.batches[0].atomic:

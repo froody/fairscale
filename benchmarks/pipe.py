@@ -1,7 +1,6 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 
 import argparse
-import logging
 import math
 import os
 import time
@@ -24,8 +23,6 @@ from fairscale.nn.pipe import LazyModule, pipe
 from fairscale.optim import GradScaler
 from fairscale.optim.oss import OSS
 from tests.nn.model_parallel.commons import dist_init, get_worker_map
-
-import torch.autograd.profiler as profiler
 
 try:
     from fairscale.optim import Adam  # type: ignore
@@ -385,10 +382,7 @@ def train(lm_dataloader, model, criterion, optimizer, vocab_size, args):
                 torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.SUM, group=ddp_group)
                 loss /= ddp_group.size()
 
-            # with profiler.profile(record_shapes=True, profile_memory=True) as prof:
-            #    with profiler.record_function("tail-backward"):
             loss.backward()
-            # print(prof.key_averages().table())
             del target
         elif pipe_group.rank() == 0:  # FIXME
             if args.ddp_zero:

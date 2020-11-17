@@ -28,7 +28,6 @@ from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple, Type, U
 import torch
 from torch import Tensor, nn
 from torch.autograd.profiler import record_function
-import torch.autograd.profiler as profiler
 
 from fairscale.nn.model_parallel import get_pipeline_parallel_ranks
 
@@ -188,7 +187,7 @@ def create_task(
             with use_skip_tracker(skip_tracker), record_function("chunk%d-part%d" % (chunk_id, part_id)):
                 result = partition(input)
                 if loss_func and target is not None:
-                    #print(f"check loss")
+                    # print(f"check loss")
                     result = loss_func(result, target.tensor_or_tensors)
                     del target
                 return result
