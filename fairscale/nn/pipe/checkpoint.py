@@ -118,8 +118,9 @@ class Checkpointing:
         phony = Recompute.apply(phony, self.recomputed, self.rng_states, self.function, input_atomic, *input)
         batch[0] = join(batch[0], phony)
 
-    def split(self, batch: Batch) -> None:
-        """Applies :class:`Recompute` to the batch in place."""
+    def split(self) -> Tensor:
+        """Applies :class:`Recompute` on a detached copy of the batch, so that
+        RecomputeBackward can run in isolation before CheckpointBackward"""
         input_atomic = self.batch.atomic
         input = tuple(self.batch)
 

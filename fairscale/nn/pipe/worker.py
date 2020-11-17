@@ -78,11 +78,11 @@ class Task:
         with use_stream(self.stream), torch.set_grad_enabled(self._grad_enabled):
             return self._compute()
 
-    def split(self, batch: Batch) -> torch.Tensor:
+    def split(self) -> torch.Tensor:
         if self._split is None:
             return
         with use_stream(self.stream), torch.set_grad_enabled(self._grad_enabled):
-            return self._split(batch)
+            return self._split()
 
     def finalize(self, batch: Batch) -> None:
         if self._finalize is None:
