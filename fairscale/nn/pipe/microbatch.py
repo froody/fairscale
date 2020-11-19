@@ -56,7 +56,7 @@ class Batch:
     def __init__(self, value: TensorOrTensors, index: int) -> None:
         self.value = value
         self.atomic = torch.is_tensor(value)
-        self.split = None
+        self.split: Optional[Tensor] = None
         self.__index = index
 
     @property

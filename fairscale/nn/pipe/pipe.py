@@ -694,7 +694,7 @@ class Pipe(Module):
 
         return self._copy_streams
 
-    def forward(self, input: TensorOrTensors, *, event=None, target=None) -> TensorOrTensors:  # type: ignore
+    def forward(self, input: TensorOrTensors, *, target=None) -> TensorOrTensors:  # type: ignore
         """:class:`Pipe` is a fairly transparent module wrapper. It doesn't
         modify the input and output signature of the underlying module. But
         there's type restriction. Input and output have to be a
@@ -729,7 +729,7 @@ class Pipe(Module):
 
         # Run pipeline parallelism.
         with self.lock:
-            self.pipeline.run(self.training, batches, event, target=target)
+            self.pipeline.run(self.training, batches, target=target)
 
             if self.group and not self.final_stage:
                 # Don't merge micro-batches to avoid unnecessary edges in autograd
@@ -754,7 +754,7 @@ class Pipe(Module):
 
                 if target is not None:
                     # FIXME(tom) weighted mean if uneven shard
-                    output = torch.mean(output).reshape(1)
+                    output = torch.mean(cast(Tensor, output)).reshape(1)
 
             return output
 
@@ -766,7 +766,7 @@ class Pipe(Module):
             self.pipeline.back_helper(list(reversed(output or [])))
 
 
-def fix_zero_dim(batch, tensor):
+def fix_zero_dim(batch: microbatch.Batch, tensor: Tensor) -> Tensor:
     if batch.atomic and len(tensor.size()) == 0:
         return tensor.view(1)
     else:
@@ -784,26 +784,28 @@ class PipelinedBackwardPass(torch.autograd.Function):
     @staticmethod
     # type: ignore
     def backward(ctx, *grads) -> Tuple:
+        tensors: TensorOrTensors
+
         with torch.no_grad():
             grad_batches = microbatch.scatter(grads, len(ctx.batches))
         for grad, batch in reversed(list(zip(grad_batches, ctx.batches))):
             for t in batch:
                 t.retain_grad()
             with torch.enable_grad():
-                tensors = fix_zero_dim(batch, batch.tensor_or_tensors)
+                tensors = fix_zero_dim(batch, cast(Tensor, batch.tensor_or_tensors))
 
             torch.autograd.backward(tensors, grad_tensors=(*grad,), retain_graph=ctx.retain_graph)
 
         with torch.no_grad():
             if ctx.batches[0].atomic:
-                tensors = tuple(fix_zero_dim(b, b.tensor.grad) for b in ctx.batches)
+                tensors = tuple(fix_zero_dim(b, cast(Tensor, b.tensor.grad)) for b in ctx.batches)
                 output: TensorOrTensors = torch.cat(tensors)
             else:
                 rotated = [[t.grad for t in b.tensors] for b in ctx.batches]
                 output_buf = []
 
                 for tensors in zip(*rotated):
-                    output_buf.append(torch.cat(tensors))
+                    output_buf.append(torch.cat(cast(Tensors, tensors)))
 
                 output = tuple(output_buf)
             del ctx.batches

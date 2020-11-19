@@ -21,7 +21,6 @@ import logging
 import os
 from queue import Empty as QueueEmpty
 from queue import Queue
-from threading import Event
 from types import TracebackType
 from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple, Type, Union, cast
 
@@ -50,6 +49,7 @@ from .types import (
     Schedule,
     TensorOrTensors,
     Tensors,
+    LossFunc,
 )
 from .worker import Task, create_workers, join_workers
 
@@ -168,9 +168,9 @@ def create_task(
     partition: nn.Sequential,
     skip_trackers: List[SkipTrackerThroughPotals],
     streams: List[AbstractStream],
-    target=None,
-    loss_func=None,
-    should_split=False,
+    target: Optional[Batch] = None,
+    loss_func: Optional[LossFunc] = None,
+    should_split: bool = False,
 ) -> Task:
     # Determine whether checkpointing or not.
     if i < checkpoint_stop:
@@ -181,8 +181,8 @@ def create_task(
             skip_tracker: SkipTrackerThroughPotals = skip_trackers[i],
             chunk_id: int = i,
             part_id: int = j,
-            target=target,
-            loss_func=loss_func,
+            target: Optional[Batch] = target,
+            loss_func: Optional[LossFunc] = loss_func,
         ) -> TensorOrTensors:
             with use_skip_tracker(skip_tracker), record_function("chunk%d-part%d" % (chunk_id, part_id)):
                 result = partition(input)
@@ -210,8 +210,8 @@ def create_task(
             skip_tracker: SkipTrackerThroughPotals = skip_trackers[i],
             chunk_id: int = i,
             part_id: int = j,
-            target=target,
-            loss_func=loss_func,
+            target: Optional[Batch] = target,
+            loss_func: Optional[LossFunc] = loss_func,
         ) -> Batch:
             with use_skip_tracker(skip_tracker), record_function("chunk%d-part%d" % (chunk_id, part_id)):
                 result = batch.call(partition)
@@ -244,7 +244,7 @@ class Pipeline:
         worker_map: Optional[Dict[int, str]] = None,
         input_device: Union[None, int, str, torch.device] = None,
         final_stage: bool = False,
-        loss_func: Optional[nn.Module] = None,
+        loss_func: Optional[LossFunc] = None,
     ) -> None:
         if style == PipelineStyle.SingleProcess:
             self.partitions = partitions
@@ -288,7 +288,9 @@ class Pipeline:
         if self.style is PipelineStyle.SingleProcess:
             join_workers(self.in_queues, self.out_queues)
 
-    def run(self, training: bool, batches: List[Batch], event: Optional[Event] = None, target=None) -> None:
+    def run(
+        self, training: bool, batches: List[Batch], target: Optional[List[Batch]] = None
+    ) -> None:
 
         """Runs pipeline parallelism.
 
@@ -324,7 +326,7 @@ class Pipeline:
             try:
                 if rank == 0 and not self.final_stage:
                     logging.debug(f"{torch.distributed.get_rank()}: entered event head")
-                    self.head_ctx = event_loop.event_loop_head(batches, skip_trackers, event)
+                    self.head_ctx = event_loop.event_loop_head(batches, skip_trackers)
                     logging.debug(f"{torch.distributed.get_rank()}: exited event head")
                 elif self.final_stage:
                     logging.debug(f"{torch.distributed.get_rank()}: entered event tail")

@@ -5,8 +5,7 @@
 
 from collections import OrderedDict
 from enum import Enum, auto
-from threading import Event
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple, Callable, Any
 
 from dataclasses import dataclass
 import torch
@@ -22,7 +21,7 @@ from fairscale.nn.model_parallel import (
 from .messages import IRecvWrapper, Transport
 from .microbatch import Batch
 from .skip.tracker import SkipTrackerThroughPotals
-from .types import EVENT_LOOP_QUEUE, PipelineStyle, PipeMessage, Tensors
+from .types import EVENT_LOOP_QUEUE, PipelineStyle, PipeMessage, Tensors, TensorOrTensors
 
 
 @dataclass(frozen=True)
@@ -182,7 +181,7 @@ class AsyncEventLoop:
         transport: Transport,
         training: bool,
         checkpoint_stop: int,
-        loss_func=None,
+        loss_func: Optional[Callable[[TensorOrTensors, TensorOrTensors], TensorOrTensors]] = None,
     ):
         self.training = training
         self.checkpoint_stop = checkpoint_stop
@@ -220,19 +219,19 @@ class AsyncEventLoop:
         partition: ModuleWrapper,
         skip_trackers: List[SkipTrackerThroughPotals],
         invocation: Invocation,
-        target=None,
+        target: Optional[List[Batch]] = None,
     ) -> Batch:
         """Actually run the forward pass for a given module, and send the result
         to the next stage in the pipeline if needed."""
         assert self.group
         from .pipeline import create_task
 
-        target_args = {}
-        if self.training and None not in (target, self.loss_func) and invocation.dest is None:
+        target_args: Dict[str, Any] = {}
+        if self.training and target is not None and self.loss_func is not None and invocation.dest is None:
             target_args["target"] = target.pop(0)
             target_args["loss_func"] = self.loss_func
 
-        does_send = invocation.dest and invocation.dest.stage != invocation.this.stage
+        does_send = (invocation.dest is not None) and invocation.dest.stage != invocation.this.stage
         should_split = does_send and batch.index < self.checkpoint_stop
 
         task = create_task(
@@ -243,9 +242,9 @@ class AsyncEventLoop:
             batch,
             partition.module,
             skip_trackers,
-            [],
-            **target_args,
+            streams=[],
             should_split=should_split,
+            **target_args,
         )
         result = task.compute()
 
@@ -256,6 +255,7 @@ class AsyncEventLoop:
             task.finalize(result)
 
         if does_send:
+            assert invocation.dest is not None
             ranks = get_pipeline_parallel_ranks()
             dst_rank = ranks[invocation.dest.stage]
             result = self.send_async_message(dst_rank, result, invocation)
@@ -289,7 +289,7 @@ class AsyncEventLoop:
         order: int,
         skip_trackers: List[SkipTrackerThroughPotals],
         activations: Activations,
-        target=None,
+        target: Optional[List[Batch]] = None,
     ) -> Tuple[int, int]:
         """Run invocations on the batch until we hit one that receives its input
         from a different stage (i.e. another process)"""
@@ -323,7 +323,7 @@ class AsyncEventLoop:
         return (invocations_handled, last_order)
 
     def event_loop_head(
-        self, batches: List[Batch], skip_trackers: List[SkipTrackerThroughPotals], event: Optional[Event]
+        self, batches: List[Batch], skip_trackers: List[SkipTrackerThroughPotals]
     ) -> Optional[BackwardContext]:
         """The event loop for the "head", which first performs the forward pass
         on any applicable layers for this stage, and then enters the common
@@ -340,7 +340,6 @@ class AsyncEventLoop:
             activations,
             invocations,
             count_per_order,
-            event=event,
             ignore_gradients=True,
             batches=batches,
         )
@@ -375,7 +374,9 @@ class AsyncEventLoop:
             batch = Batch(result, microbatch_index)
         return batch
 
-    def event_loop_tail(self, batches: List[Batch], skip_trackers: List[SkipTrackerThroughPotals], target=None) -> None:
+    def event_loop_tail(
+        self, batches: List[Batch], skip_trackers: List[SkipTrackerThroughPotals], target: Optional[List[Batch]] = None,
+    ) -> None:
         """The event loop for the "tail", or final stage which only processes
         activations and then returns to the caller so that the loss can be
         calculated. This also handles the first/only stage for the special
@@ -436,9 +437,8 @@ class AsyncEventLoop:
         batches: Optional[List[Batch]] = None,
         ignore_activations: bool = False,
         ignore_gradients: bool = False,
-        event: Optional[Event] = None,
         tail: bool = False,
-        target=None,
+        target: Optional[List[Batch]] = None,
     ) -> None:
         """The common event loop shared by all stages. This processses
         activations for the forward pass, and if `self.training` is true,

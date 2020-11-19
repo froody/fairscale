@@ -14,6 +14,7 @@ from fairscale.nn.model_parallel.initialize import get_pipeline_parallel_group
 
 from . import Pipe
 from .types import EVENT_LOOP_QUEUE, PipeMessage, TensorOrTensors
+from .messages import Transport
 
 PipeModel: Pipe
 PipeResult: TensorOrTensors
@@ -42,7 +43,9 @@ def get_dtype(tensor: TensorOrTensors) -> DtypeOrDtypes:
         return [t.dtype for t in tensor]
 
 
-def recv_message_tensors(transport, message: PipeMessage, shapes: SizeOrSizes, dtypes: DtypeOrDtypes):
+def recv_message_tensors(
+    transport: Transport, message: PipeMessage, shapes: SizeOrSizes, dtypes: DtypeOrDtypes
+) -> TensorOrTensors:
     if isinstance(shapes, torch.Size):
         message.tensor_shapes = [cast(torch.Size, shapes)]
         message.tensor_dtypes = [cast(torch.dtype, dtypes)]
@@ -179,15 +182,16 @@ class PipeRPCWrapper(nn.Module):
                 )
                 for rank in range(1, self.group.size() - 1)
             ]
+            target_tensor: TensorOrTensors
             if isinstance(target, torch.Tensor):
                 num_targets = 1
-                target_shape = [get_shapes(target)]
-                target_dtype = [get_dtype(target)]
+                target_shape = [cast(torch.Size, get_shapes(target))]
+                target_dtype = [cast(torch.dtype, get_dtype(target))]
                 target_tensor = (target,)
             else:
                 num_targets = len(target)
-                target_shape = get_shapes(target)
-                target_dtype = get_dtype(target)
+                target_shape = cast(List[torch.Size], get_shapes(target))
+                target_dtype = cast(List[torch.dtype], get_dtype(target))
                 target_tensor = target
 
             target_rank = self.group.size() - 1  # FIXME(tom) with reuse, last stage might not be on rank -1?
@@ -208,6 +212,7 @@ class PipeRPCWrapper(nn.Module):
                 )
             )
             target_msg.tensors = target_tensor
+            assert self.model.pipeline
             self.model.pipeline.transport.send_message(target_msg, sync=True, skip_header=True)
 
         if self.model.final_stage:
@@ -304,8 +309,11 @@ class PipeRPCWrapper(nn.Module):
             set_device_based_on_group(model.group)
 
             if target:
+                assert model.pipeline
                 target = model.pipeline.transport.recv_message_tensors(target)
                 torch.cuda.synchronize()
+
+                target_tensors: Optional[TensorOrTensors]
                 if len(target.tensor_shapes) == 1:
                     target_tensors = target.tensors[0]
                 else:

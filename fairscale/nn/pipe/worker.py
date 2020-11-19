@@ -66,7 +66,7 @@ class Task:
         *,
         compute: Callable[[], Batch],
         finalize: Optional[Callable[[Batch], None]],
-        split: Optional[Callable[[Batch], None]] = None,
+        split: Optional[Callable[[], torch.Tensor]] = None,
     ) -> None:
         self.stream = stream
         self._compute = compute

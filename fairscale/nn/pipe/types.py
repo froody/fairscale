@@ -23,7 +23,7 @@ TensorOrTensors = Union[Tensor, Tensors]
 
 InputDevice = Union[None, int, str, torch.device]
 Schedule = List[Tuple[int, int]]
-
+LossFunc = Callable[[TensorOrTensors, TensorOrTensors], TensorOrTensors]
 
 class LazyModule:
     def __init__(self, function: Callable[[], nn.Module]):
