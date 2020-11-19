@@ -13,8 +13,8 @@ from torch.distributed.distributed_c10d import _get_global_rank
 from fairscale.nn.model_parallel.initialize import get_pipeline_parallel_group
 
 from . import Pipe
-from .types import EVENT_LOOP_QUEUE, PipeMessage, TensorOrTensors
-from .messages import Transport
+from .types import PIPE_RPC_QUEUE, PipeMessage, TensorOrTensors
+from .messages import Transport, RpcTransport
 
 PipeModel: Pipe
 PipeResult: TensorOrTensors
@@ -43,18 +43,25 @@ def get_dtype(tensor: TensorOrTensors) -> DtypeOrDtypes:
         return [t.dtype for t in tensor]
 
 
+def recv_tensors_wrapper(transport, message):
+    if isinstance(transport, RpcTransport):
+        return transport.recv_message(PIPE_RPC_QUEUE)
+    else:
+        return transport.recv_message_tensors(message)
+
+
 def recv_message_tensors(
     transport: Transport, message: PipeMessage, shapes: SizeOrSizes, dtypes: DtypeOrDtypes
 ) -> TensorOrTensors:
     if isinstance(shapes, torch.Size):
         message.tensor_shapes = [cast(torch.Size, shapes)]
         message.tensor_dtypes = [cast(torch.dtype, dtypes)]
-        message = transport.recv_message_tensors(message)
+        message = recv_tensors_wrapper(transport, message)
         return message.tensors[0]
     else:
         message.tensor_shapes = cast(List[torch.Size], shapes)
         message.tensor_dtypes = cast(List[torch.dtype], dtypes)
-        message = transport.recv_message_tensors(message)
+        message = transport.recv_tensors_wrapper(transport, message)
         return message.tensors
 
 
@@ -164,7 +171,7 @@ class PipeRPCWrapper(nn.Module):
     def forward(self, tensor: TensorOrTensors, target: Optional[TensorOrTensors] = None) -> TensorOrTensors:  # type: ignore
         shape = get_shapes(tensor)
         dtype = get_dtype(tensor)
-        queue = EVENT_LOOP_QUEUE
+        queue = PIPE_RPC_QUEUE
 
         if isinstance(tensor, torch.Tensor):
             num_tensors = 1
@@ -277,7 +284,7 @@ class PipeRPCWrapper(nn.Module):
             if training:
                 grads_message.tensor_shapes = [r.shape for r in result]
                 grads_message.tensor_dtypes = [r.dtype for r in result]
-                grads_message = transport.recv_message_tensors(grads_message)
+                grads_message = recv_tensors_wrapper(transport, grads_message)
 
                 with model.lock:
                     torch.autograd.backward(result, grads_message.tensors, retain_graph=True)
@@ -310,7 +317,7 @@ class PipeRPCWrapper(nn.Module):
 
             if target:
                 assert model.pipeline
-                target = model.pipeline.transport.recv_message_tensors(target)
+                target = recv_tensors_wrapper(model.pipeline.transport, target)
                 torch.cuda.synchronize()
 
                 target_tensors: Optional[TensorOrTensors]

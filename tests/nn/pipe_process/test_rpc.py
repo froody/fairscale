@@ -14,17 +14,17 @@ from tests.nn.model_parallel.commons import get_worker_map, torch_spawn
 def init_rpc(offset=0):
     os.environ["MASTER_PORT"] = f"{10639 + offset}"
     init_method = f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}"
-    rpc.init_rpc(
-        f"Test{torch.distributed.get_rank()}",
-        rank=torch.distributed.get_rank(),
-        world_size=torch.distributed.get_world_size(),
-        backend=rpc.BackendType.TENSORPIPE,
-        rpc_backend_options=rpc.TensorPipeRpcBackendOptions(init_method=init_method),
-    )
+    if "OMPI_COMM_WORLD_RANK" in os.environ:
+        rpc.init_rpc(
+            f"Test{torch.distributed.get_rank()}",
+            rank=torch.distributed.get_rank(),
+            world_size=torch.distributed.get_world_size(),
+            backend=rpc.BackendType.TENSORPIPE,
+            rpc_backend_options=rpc.TensorPipeRpcBackendOptions(init_method=init_method),
+        )
 
 
 @torch_spawn([2])
-@pytest.mark.skipif("OMPI_COMM_WORLD_RANK" not in os.environ, reason="mpi required")
 def basic_rpc():
     init_rpc()
     if torch.distributed.get_rank() != 0:
@@ -139,7 +139,6 @@ def check_pipe_against_reference(balance, model_constructor, checkpoint="except_
 
 
 @torch_spawn([3])
-@pytest.mark.skipif("OMPI_COMM_WORLD_RANK" not in os.environ, reason="mpi required")
 @pytest.mark.parametrize("checkpoint", ["never", "always", "except_last"])
 def rpc_optimizer(checkpoint):
     init_rpc({"never": 0, "always": 1, "except_last": 2}[checkpoint])
@@ -219,7 +218,6 @@ def rpc_megatron_reuse():
 
 
 @torch_spawn([3])
-@pytest.mark.skipif("OMPI_COMM_WORLD_RANK" not in os.environ, reason="mpi required")
 def rpc_reuse_in_final_stage():
 
     # 'reused' and 'reused2' are located on stage 2, so the backward pass for
@@ -265,7 +263,6 @@ def rpc_reuse_in_final_stage():
 
 
 @torch_spawn([3])
-@pytest.mark.skipif("OMPI_COMM_WORLD_RANK" not in os.environ, reason="mpi required")
 def rpc_multiple_tensors():
     class FuseTwo(nn.Module):
         def forward(self, left, right):
@@ -277,7 +274,6 @@ def rpc_multiple_tensors():
 
 
 @torch_spawn([2])
-@pytest.mark.skipif("OMPI_COMM_WORLD_RANK" in os.environ, reason="no mpi")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="cuda required")
 def construct_only_rank_zero():
     model = [nn.Linear(10, 10), nn.ReLU()]
