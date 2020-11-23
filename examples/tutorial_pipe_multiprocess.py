@@ -13,7 +13,7 @@ from fairscale.nn.model_parallel import initialize_model_parallel
 def run(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "10638"
-    torch.distributed.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    torch.distributed.init_process_group(backend="gloo", rank=rank, world_size=world_size)
     os.environ["MASTER_PORT"] = "10639"
     torch.distributed.rpc.init_rpc(f"worker{rank}", rank=rank, world_size=world_size)
     initialize_model_parallel(1, world_size)
@@ -23,7 +23,7 @@ def run(rank, world_size):
     data = torch.randn(20, 10)
     loss_fn = F.nll_loss
 
-    device = torch.device("cuda", rank)
+    device = torch.device("cpu")
 
     model = fairscale.nn.Pipe(
         model,
